@@ -1,31 +1,24 @@
 /***********************************************************************************************************************************
-Verify File
+Crypto Harness
 ***********************************************************************************************************************************/
-#ifndef COMMAND_VERIFY_FILE_H
-#define COMMAND_VERIFY_FILE_H
+#ifndef TEST_HARNESS_CRYPTO_H
+#define TEST_HARNESS_CRYPTO_H
 
-#include "common/compress/helper.h"
-#include "common/crypto/spec.h"
+#include "common/type/buffer.h"
+#include "common/type/stringList.h"
 
 /***********************************************************************************************************************************
-File result
+Macros
 ***********************************************************************************************************************************/
-typedef enum
-{
-    verifyOk,                                                       // Default result - file OK
-    verifyFileMissing,
-    verifyChecksumMismatch,
-    verifySizeInvalid,
-    verifyOtherError,
-} VerifyResult;
+// Fields of an aes-256-gcm identity, or of the associated data made from one, separated by |. Tests write the fields out rather
+// than build them with the code under test so that a difference in either shows.
+#define HRN_CIPHER_IDENTITY(fields)                                 strLstNewSplitZ(STRDEF(fields), "|")
 
 /***********************************************************************************************************************************
 Functions
 ***********************************************************************************************************************************/
-// Verify a file in the pgBackRest repository. An encrypted file is decrypted with the identity it is bound to, see
-// cipherFormatFilterGroupAdd().
-FN_EXTERN VerifyResult verifyFile(
-    const String *filePathName, uint64_t offset, const Variant *limit, CompressType compressType, const Buffer *fileChecksum,
-    uint64_t fileSize, const CipherSpec *cipherSpec, const StringList *cipherIdentity);
+// Set the bytes returned by the next call to cryptoRandomBytes(), e.g. the salt and nonce prefix of a known-answer test. The next
+// call must ask for exactly this many bytes and later calls are random again.
+void hrnCryptoRandomBytesSet(const Buffer *random);
 
 #endif

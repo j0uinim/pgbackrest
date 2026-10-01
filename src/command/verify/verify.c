@@ -15,9 +15,8 @@ Verify contents of the repository.
 #include "command/verify/protocol.h"
 #include "command/verify/verify.h"
 #include "common/compress/helper.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/debug.h"
-#include "common/format/cipherBlockFormat.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/fdWrite.h"
 #include "common/io/io.h"
 #include "common/log.h"
@@ -197,9 +196,12 @@ verifyInfoFile(const String *const pathFileName, const bool keepFile, const Ciph
             // Add decryption after the hash so the checksum is over the file as stored. An info file is read through the filter
             // that reads its header, a manifest with the spec as it was given since it has no header of its own.
             if (isBackup || isArchive)
-                cipherBlockFormatFilterGroupReadAdd(ioReadFilterGroup(infoRead), cipherSpec);
+                cipherFormatInfoReadAdd(ioReadFilterGroup(infoRead), cipherSpec, isBackup ? INFO_BACKUP_FILE : INFO_ARCHIVE_FILE);
             else
-                cipherBlockFilterGroupAdd(ioReadFilterGroup(infoRead), cipherModeDecrypt, cipherSpec);
+            {
+                cipherFormatFilterGroupAdd(
+                    ioReadFilterGroup(infoRead), cipherModeDecrypt, cipherSpec, manifestCipherIdentity(pathFileName));
+            }
 
             // If directed to keep the loaded file in memory, then move the file into the result, else drain the io and close it
             if (keepFile)
@@ -369,6 +371,9 @@ verifyManifestFile(
         // Get the main manifest file
         const VerifyInfoFile verifyManifestInfo = verifyInfoFile(fileName, true, cipherSpecManifest);
 
+        // An aes-256-gcm copy is the in-progress manifest, so it is neither compared with the main file nor used in its place
+        const bool copyUsable = cipherSpecType(cipherSpecManifest) != cipherTypeAes256Gcm;
+
         // If the main file did not error, then report on the copy's status and check checksums
         if (verifyManifestInfo.errorCode == 0)
         {
@@ -380,16 +385,19 @@ verifyManifestFile(
             currentBackup = false;
 
             // Attempt to load the copy and report on it's status but don't keep it in memory
-            const VerifyInfoFile verifyManifestInfoCopy = verifyInfoFile(
-                strNewFmt("%s%s", strZ(fileName), INFO_COPY_EXT), false, cipherSpecManifest);
-
-            // If the copy loaded successfully, then check the checksums
-            if (verifyManifestInfoCopy.errorCode == 0)
+            if (copyUsable)
             {
-                // If the manifest and manifest.copy checksums don't match each other than one (or both) of the files could be
-                // corrupt so log a warning but trust main
-                if (!strEq(verifyManifestInfo.checksum, verifyManifestInfoCopy.checksum))
-                    LOG_DETAIL_FMT("backup '%s' manifest.copy does not match manifest", strZ(backupResult->backupLabel));
+                const VerifyInfoFile verifyManifestInfoCopy = verifyInfoFile(
+                    strNewFmt("%s%s", strZ(fileName), INFO_COPY_EXT), false, cipherSpecManifest);
+
+                // If the copy loaded successfully, then check the checksums
+                if (verifyManifestInfoCopy.errorCode == 0)
+                {
+                    // If the manifest and manifest.copy checksums don't match each other than one (or both) of the files could be
+                    // corrupt so log a warning but trust main
+                    if (!strEq(verifyManifestInfo.checksum, verifyManifestInfoCopy.checksum))
+                        LOG_DETAIL_FMT("backup '%s' manifest.copy does not match manifest", strZ(backupResult->backupLabel));
+                }
             }
         }
         else
@@ -401,18 +409,28 @@ verifyManifestFile(
             {
                 currentBackup = false;
 
-                const VerifyInfoFile verifyManifestInfoCopy = verifyInfoFile(
-                    strNewFmt("%s%s", strZ(fileName), INFO_COPY_EXT), true, cipherSpecManifest);
+                const String *const fileNameCopy = strNewFmt("%s%s", strZ(fileName), INFO_COPY_EXT);
+                bool copyMissing;
 
-                // If loaded successfully, then return the copy as usable
-                if (verifyManifestInfoCopy.errorCode == 0)
+                if (copyUsable)
                 {
-                    LOG_DETAIL_FMT("%s/backup.manifest is missing or unusable, using copy", strZ(backupResult->backupLabel));
+                    const VerifyInfoFile verifyManifestInfoCopy = verifyInfoFile(fileNameCopy, true, cipherSpecManifest);
 
-                    result = verifyManifestInfoCopy.manifest;
+                    // If loaded successfully, then return the copy as usable
+                    if (verifyManifestInfoCopy.errorCode == 0)
+                    {
+                        LOG_DETAIL_FMT("%s/backup.manifest is missing or unusable, using copy", strZ(backupResult->backupLabel));
+
+                        result = verifyManifestInfoCopy.manifest;
+                    }
+
+                    copyMissing = verifyManifestInfoCopy.errorCode == errorTypeCode(&FileMissingError);
                 }
-                else if (verifyManifestInfo.errorCode == errorTypeCode(&FileMissingError) &&
-                         verifyManifestInfoCopy.errorCode == errorTypeCode(&FileMissingError))
+                // Else the copy is not loaded, but a backup that has neither file may have expired like any other
+                else
+                    copyMissing = !storageExistsP(storageRepo(), fileNameCopy);
+
+                if (verifyManifestInfo.errorCode == errorTypeCode(&FileMissingError) && copyMissing)
                 {
                     backupResult->status = backupMissingManifest;
 
@@ -637,7 +655,7 @@ verifyBackupSet(VerifyJobData *const jobData, const String *const backupLabel)
     {
         TRY_BEGIN()
         {
-            const Manifest *const manifest = manifestLoadFile(
+            const Manifest *const manifest = manifestLoadFileP(
                 storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel)),
                 jobData->cipherSpecManifest);
 
@@ -809,14 +827,16 @@ verifyArchive(VerifyJobData *const jobData)
                             if (archiveResult->pgWalInfo.size == 0)
                             {
                                 // Initialize the WAL segment size from the first WAL
-                                const String *const walFile = strNewFmt(
-                                    STORAGE_REPO_ARCHIVE "/%s/%s/%s", strZ(archiveResult->archiveId), strZ(walPath),
+                                const String *const walName = strNewFmt(
+                                    "%s/%s/%s", strZ(archiveResult->archiveId), strZ(walPath),
                                     strZ(strLstGet(jobData->walFileList, 0)));
+                                const String *const walFile = strNewFmt(STORAGE_REPO_ARCHIVE "/%s", strZ(walName));
                                 StorageRead *const walRead = storageNewReadP(storageRepo(), walFile);
                                 IoFilterGroup *const walFilterGroup = ioReadFilterGroup(storageReadIo(walRead));
 
                                 // Add decryption filter when required
-                                cipherBlockFilterGroupAdd(walFilterGroup, cipherModeDecrypt, jobData->cipherSpecArchive);
+                                cipherFormatFilterGroupAdd(
+                                    walFilterGroup, cipherModeDecrypt, jobData->cipherSpecArchive, archiveCipherIdentity(walName));
 
                                 // If the file is compressed, add a decompression filter
                                 if (compressTypeFromName(walFile) != compressTypeNone)
@@ -843,8 +863,9 @@ verifyArchive(VerifyJobData *const jobData)
                     {
                         // Get the fully qualified file name and checksum
                         const String *const fileName = strLstGet(jobData->walFileList, 0);
-                        const String *const filePathName = strNewFmt(
-                            STORAGE_REPO_ARCHIVE "/%s/%s/%s", strZ(archiveResult->archiveId), strZ(walPath), strZ(fileName));
+                        const String *const archiveName = strNewFmt(
+                            "%s/%s/%s", strZ(archiveResult->archiveId), strZ(walPath), strZ(fileName));
+                        const String *const filePathName = strNewFmt(STORAGE_REPO_ARCHIVE "/%s", strZ(archiveName));
                         const Buffer *const checksum = bufNewDecode(
                             encodingHex, strSubN(fileName, WAL_SEGMENT_NAME_SIZE + 1, HASH_TYPE_SHA1_SIZE_HEX));
 
@@ -857,6 +878,7 @@ verifyArchive(VerifyJobData *const jobData)
                         pckWriteBinP(param, checksum);
                         pckWriteU64P(param, archiveResult->pgWalInfo.size);
                         cipherSpecPack(param, jobData->cipherSpecArchive);
+                        pckWriteStrLstP(param, archiveCipherIdentity(archiveName));
 
                         // Assign job to result, prepending the archiveId to the key for consistency with backup processing
                         const String *const jobKey = strNewFmt("%s/%s", strZ(archiveResult->archiveId), strZ(filePathName));
@@ -1091,6 +1113,7 @@ verifyBackup(VerifyJobData *const jobData)
                                 pckWriteBinP(param, BUF(fileData.checksumRepoSha1, HASH_TYPE_SHA1_SIZE));
                                 pckWriteU64P(param, fileData.sizeRepo);
                                 cipherSpecPack(param, cipherSpecNewNone());
+                                pckWriteStrLstP(param, NULL);
                             }
                             // Else use the file checksum, which may require additional filters, e.g. decompression
                             else
@@ -1099,6 +1122,7 @@ verifyBackup(VerifyJobData *const jobData)
                                 pckWriteBinP(param, BUF(fileData.checksumSha1, HASH_TYPE_SHA1_SIZE));
                                 pckWriteU64P(param, fileData.size);
                                 cipherSpecPack(param, manifestCipherSpec(jobData->manifest));
+                                pckWriteStrLstP(param, backupFileCipherIdentity(fileBackupLabel, fileData.name));
                             }
 
                             // Assign job to result (prepend backup label being processed to the key since some files are in a prior

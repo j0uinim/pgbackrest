@@ -3,10 +3,14 @@ Test Archive Info Handler
 ***********************************************************************************************************************************/
 #include <stdio.h>
 
+#include "common/crypto/cipherGcm.h"
+#include "common/format/cipherBlockFormat.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "storage/posix/storage.h"
 
+#include "harness/config.h"
 #include "harness/info.h"
 
 /***********************************************************************************************************************************
@@ -190,5 +194,46 @@ testRun(void)
             infoArchive, infoArchiveLoadFile(storageTest, STRDEF(INFO_ARCHIVE_FILE), cipherSpecNewNone()),
             "load copy");
         TEST_RESULT_UINT(infoPgDataCurrent(infoArchivePg(infoArchive)).systemId, 6569239123849665999, "check file loaded");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("save and load archive info file with aes-256-gcm");
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("demo"));
+
+        infoArchive = infoArchiveNew(
+            PG_VERSION_10, 6569239123849665999, REPOSITORY_FORMAT_7,
+            cipherSpecNewP(cipherTypeAes256Gcm, BUFSTR(cipherGcmKeyNew()), .digest = hashTypeSha256));
+        TEST_RESULT_VOID(infoArchiveSaveFile(infoArchive, storageTest, STRDEF(INFO_ARCHIVE_FILE), cipherSpecGcm), "save");
+
+        const Buffer *const infoGcm = storageGetP(storageNewReadP(storageTest, STRDEF(INFO_ARCHIVE_FILE)));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(infoGcm), 8)), "PGBR007G", "format 7 prefix");
+        TEST_RESULT_BOOL(
+            bufEq(infoGcm, storageGetP(storageNewReadP(storageTest, STRDEF(INFO_ARCHIVE_FILE INFO_COPY_EXT)))), true,
+            "copy is the same bytes");
+
+        TEST_ASSIGN(infoArchive, infoArchiveLoadFile(storageTest, STRDEF(INFO_ARCHIVE_FILE), cipherSpecGcm), "load");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoArchivePg(infoArchive)).systemId, 6569239123849665999, "check file loaded");
+        TEST_RESULT_STR_Z(cipherSpecStanza(infoArchiveCipherSpec(infoArchive)), "demo", "subpass bound to the stanza");
+
+        // The same bytes do not decrypt as another info file or as the file of another stanza
+        IoRead *read = ioBufferReadNew(infoGcm);
+
+        cipherFormatInfoReadAdd(ioReadFilterGroup(read), cipherSpecGcm, "backup.info");
+        ioReadOpen(read);
+        TEST_ERROR(ioReadBuf(read), CryptoError, "cipher segment 0 failed authentication");
+
+        read = ioBufferReadNew(infoGcm);
+
+        cipherFormatInfoReadAdd(
+            ioReadFilterGroup(read),
+            cipherSpecNewP(
+                cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("other")),
+            INFO_ARCHIVE_FILE);
+        ioReadOpen(read);
+        TEST_ERROR(ioReadBuf(read), CryptoError, "cipher segment 0 failed authentication");
+#endif
     }
 }

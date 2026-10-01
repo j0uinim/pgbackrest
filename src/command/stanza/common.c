@@ -5,6 +5,7 @@ Stanza Commands Handler
 
 #include "command/check/common.h"
 #include "command/stanza/common.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/debug.h"
 #include "common/format/format.h"
 #include "common/log.h"
@@ -17,17 +18,32 @@ Stanza Commands Handler
 
 /**********************************************************************************************************************************/
 FN_EXTERN CipherSpec *
-cipherSpecGen(const CipherType cipherType, const unsigned int format)
+cipherSpecGen(const CipherSpec *const cipherSpecParent, const unsigned int format)
 {
     FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(STRING_ID, cipherType);
+        FUNCTION_TEST_PARAM(CIPHER_SPEC, cipherSpecParent);
         FUNCTION_TEST_PARAM(UINT, format);
     FUNCTION_TEST_END();
 
+    ASSERT(cipherSpecParent != NULL);
+
+    const CipherType cipherType = cipherSpecType(cipherSpecParent);
     CipherSpec *result;
 
     if (cipherType == cipherTypeNone)
         result = cipherSpecNewNone();
+    // An aes-256-gcm pass is a key of random bytes, since the key is used as it is rather than derived from the pass
+    else if (cipherType == cipherTypeAes256Gcm)
+    {
+        MEM_CONTEXT_TEMP_BEGIN()
+        {
+            result = cipherSpecNewP(
+                cipherType, BUFSTR(cipherGcmKeyNew()), .digest = repoFormatDigest(format),
+                .stanza = cipherSpecStanza(cipherSpecParent));
+            cipherSpecMove(result, memContextPrior());
+        }
+        MEM_CONTEXT_TEMP_END();
+    }
     else
     {
         MEM_CONTEXT_TEMP_BEGIN()
@@ -40,7 +56,7 @@ cipherSpecGen(const CipherType cipherType, const unsigned int format)
             // reader derives the same key.
             result = cipherSpecNewP(
                 cipherType, BUFSTR(strNewEncode(encodingBase64, BUF(buffer, sizeof(buffer)))),
-                .digest = repoFormatDigest(format));
+                .digest = repoFormatDigest(format), .stanza = cipherSpecStanza(cipherSpecParent));
             cipherSpecMove(result, memContextPrior());
         }
         MEM_CONTEXT_TEMP_END();

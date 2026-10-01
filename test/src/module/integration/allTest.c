@@ -2,6 +2,7 @@
 Real Integration Test
 ***********************************************************************************************************************************/
 #include "common/crypto/common.h"
+#include "common/type/json.h"
 #include "config/config.h"
 #include "info/infoBackup.h"
 #include "postgres/interface.h"
@@ -19,17 +20,17 @@ Test definition
 static HrnHostTestDefine testMatrix[] =
 {
     // {uncrustify_off - struct alignment}
-    {.pg = "9.6", .repo = "repo", .tls = 0, .stg = "azure", .enc = 0, .cmp = "none", .rt = 2, .bnd = 1, .bi = 1},
-    {.pg =  "10", .repo =  "pg2", .tls = 0, .stg =  "sftp", .enc = 1, .cmp =   "gz", .rt = 1, .bnd = 1, .bi = 0},
-    {.pg =  "11", .repo = "repo", .tls = 1, .stg =   "gcs", .enc = 0, .cmp =  "lz4", .rt = 2, .bnd = 0, .bi = 0},
-    {.pg =  "12", .repo = "repo", .tls = 0, .stg =    "s3", .enc = 1, .cmp =  "zst", .rt = 1, .bnd = 1, .bi = 1},
-    {.pg =  "13", .repo =  "pg2", .tls = 1, .stg = "azure", .enc = 0, .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
-    {.pg =  "14", .repo = "repo", .tls = 0, .stg =   "gcs", .enc = 0, .cmp =  "bz2", .rt = 1, .bnd = 1, .bi = 0},
-    {.pg =  "15", .repo =  "pg2", .tls = 0, .stg = "posix", .enc = 1, .cmp = "none", .rt = 2, .bnd = 1, .bi = 1},
-    {.pg =  "16", .repo = "repo", .tls = 0, .stg =  "sftp", .enc = 0, .cmp =  "zst", .rt = 1, .bnd = 1, .bi = 1},
-    {.pg =  "17", .repo = "repo", .tls = 0, .stg = "posix", .enc = 0, .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
-    {.pg =  "18", .repo =  "pg2", .tls = 1, .stg =    "s3", .enc = 1, .cmp =  "lz4", .rt = 1, .bnd = 1, .bi = 1},
-    {.pg =  "19", .repo = "repo", .tls = 0, .stg = "posix", .enc = 0, .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
+    {.pg = "9.6", .repo = "repo", .tls = 0, .stg = "azure", .enc =        "none", .cmp = "none", .rt = 2, .bnd = 1, .bi = 1},
+    {.pg =  "10", .repo =  "pg2", .tls = 0, .stg =  "sftp", .enc = "aes-256-cbc", .cmp =   "gz", .rt = 1, .bnd = 1, .bi = 0},
+    {.pg =  "11", .repo = "repo", .tls = 1, .stg =   "gcs", .enc =        "none", .cmp =  "lz4", .rt = 2, .bnd = 0, .bi = 0},
+    {.pg =  "12", .repo = "repo", .tls = 0, .stg =    "s3", .enc = "aes-256-cbc", .cmp =  "zst", .rt = 1, .bnd = 1, .bi = 1},
+    {.pg =  "13", .repo =  "pg2", .tls = 1, .stg = "azure", .enc =        "none", .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
+    {.pg =  "14", .repo = "repo", .tls = 0, .stg =   "gcs", .enc =        "none", .cmp =  "bz2", .rt = 1, .bnd = 1, .bi = 0},
+    {.pg =  "15", .repo =  "pg2", .tls = 0, .stg = "posix", .enc = "aes-256-cbc", .cmp = "none", .rt = 2, .bnd = 1, .bi = 1},
+    {.pg =  "16", .repo = "repo", .tls = 0, .stg =  "sftp", .enc =        "none", .cmp =  "zst", .rt = 1, .bnd = 1, .bi = 1},
+    {.pg =  "17", .repo = "repo", .tls = 0, .stg = "posix", .enc =        "none", .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
+    {.pg =  "18", .repo =  "pg2", .tls = 1, .stg =    "s3", .enc = "aes-256-gcm", .cmp =  "lz4", .rt = 1, .bnd = 1, .bi = 1},
+    {.pg =  "19", .repo = "repo", .tls = 0, .stg = "posix", .enc =        "none", .cmp = "none", .rt = 1, .bnd = 0, .bi = 0},
     // {uncrustify_on}
 };
 
@@ -45,6 +46,34 @@ Test statuses
 #define TEST_STATUS_XID                                             "xid"
 
 #define TEST_RESTORE_POINT                                          "pgbackrest"
+
+/***********************************************************************************************************************************
+Total of backups in repo 1. The info command counts them on the repository host rather than this binary loading backup.info, since
+the host may be able to read a cipher type that this binary cannot, e.g. aes-256-gcm needs OpenSSL 3.0.8 and this binary may be
+built with an earlier version.
+***********************************************************************************************************************************/
+static unsigned int
+testBackupTotal(HrnHost *const repo)
+{
+    FUNCTION_HARNESS_BEGIN();
+        FUNCTION_HARNESS_PARAM(HRN_HOST, repo);
+    FUNCTION_HARNESS_END();
+
+    unsigned int result;
+
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        const VariantList *const stanzaList = varVarLst(
+            jsonToVar(hrnHostExecBrP(repo, CFGCMD_INFO, .option = "--output=json --repo=1")));
+
+        CHECK(AssertError, varLstSize(stanzaList) == 1, "expected one stanza");
+
+        result = varLstSize(varVarLst(kvGet(varKv(varLstGet(stanzaList, 0)), VARSTRDEF("backup"))));
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    FUNCTION_HARNESS_RETURN(UINT, result);
+}
 
 /***********************************************************************************************************************************
 Test Run
@@ -203,24 +232,18 @@ testRun(void)
                 TEST_HOST_BR(repo, CFGCMD_STANZA_UPGRADE, .option = "--repo1-format=6");
 
             // Check backups before the backup so we know how many will exist after
-            const InfoBackup *infoBackup = infoBackupLoadFile(
-                hrnHostRepo1Storage(repo), STRDEF("backup/" HRN_STANZA "/backup.info"), hrnHostCipherSpec());
-            TEST_RESULT_UINT(infoBackupDataTotal(infoBackup), 1, "backup total = 1");
+            TEST_RESULT_UINT(testBackupTotal(repo), 1, "backup total = 1");
 
             TEST_HOST_BR(repo, CFGCMD_BACKUP, .option = "--type=full --backup-standby --repo1-retention-full=1 --no-expire-auto");
 
             // Expire was disabled so the backup total has increased
-            infoBackup = infoBackupLoadFile(
-                hrnHostRepo1Storage(repo), STRDEF("backup/" HRN_STANZA "/backup.info"), hrnHostCipherSpec());
-            TEST_RESULT_UINT(infoBackupDataTotal(infoBackup), 2, "backup total = 2");
+            TEST_RESULT_UINT(testBackupTotal(repo), 2, "backup total = 2");
 
             // Now force an expire
             TEST_HOST_BR(repo, CFGCMD_EXPIRE, .option = "--repo1-retention-full=1");
 
             // Backup has been expired
-            infoBackup = infoBackupLoadFile(
-                hrnHostRepo1Storage(repo), STRDEF("backup/" HRN_STANZA "/backup.info"), hrnHostCipherSpec());
-            TEST_RESULT_UINT(infoBackupDataTotal(infoBackup), 1, "backup total = 1");
+            TEST_RESULT_UINT(testBackupTotal(repo), 1, "backup total = 1");
 
             // Stop the standby since restores to primary will break it
             HRN_HOST_PG_STOP(pg2);

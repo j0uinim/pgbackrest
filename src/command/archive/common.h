@@ -7,6 +7,7 @@ Archive Common
 #include <sys/types.h>
 
 #include "common/type/stringId.h"
+#include "common/type/stringList.h"
 
 /***********************************************************************************************************************************
 Archive mode enum
@@ -81,6 +82,11 @@ FN_EXTERN void archiveAsyncStatusErrorWrite(ArchiveMode archiveMode, const Strin
 
 // Comparator function for sorting archive ids by the database history id (the number after the dash) e.g. 9.6-1, 10-2
 FN_EXTERN int archiveIdComparator(const void *item1, const void *item2);
+
+// Identity of a file in the archive for aes-256-gcm, which is its name as stored under the stanza's archive path, e.g.
+// 18-1/0000000100000001/000000010000000100000001-<sha1>.gz. The whole name is bound, including the checksum of the plaintext and
+// the compression extension, so a copy under another name, another checksum, or another extension does not decrypt.
+FN_EXTERN StringList *archiveCipherIdentity(const String *archiveFile);
 
 // Is the segment partial?
 FN_EXTERN bool walIsPartial(const String *walSegment);

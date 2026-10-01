@@ -22,6 +22,7 @@ typedef enum
 {
     cipherTypeNone = STRID5("none", 0x2b9ee0),
     cipherTypeAes256Cbc = STRID5("aes-256-cbc", 0xc43dfbbcdcca10),
+    cipherTypeAes256Gcm = STRID5("aes-256-gcm", 0x3467dfbbcdcca10),
 } CipherType;
 
 /***********************************************************************************************************************************

@@ -26,4 +26,9 @@ FN_EXTERN void cfgLoadLogFile(void);
 // Update options that have complex rules
 FN_EXTERN void cfgLoadUpdateOption(void);
 
+// Check the cipher type and pass of a repository, and set its format when the format follows the cipher. The cipher of a repository
+// on a repository host may be configured on that host only, in which case it is checked with this when it is fetched and before it
+// is set.
+FN_EXTERN void cfgLoadRepoCipher(unsigned int repoIdx, CipherType cipherType, const String *cipherPass);
+
 #endif

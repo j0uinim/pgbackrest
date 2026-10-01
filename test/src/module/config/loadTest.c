@@ -1,6 +1,8 @@
 /***********************************************************************************************************************************
 Test Configuration Load
 ***********************************************************************************************************************************/
+
+#include "common/crypto/cipherGcm.h"
 #include "common/io/io.h"
 #include "common/log.h"
 #include "protocol/helper.h"
@@ -9,6 +11,10 @@ Test Configuration Load
 #include "harness/config.h"
 #include "storage/cifs/storage.h"
 #include "storage/posix/storage.h"
+
+/***********************************************************************************************************************************
+Keys for the aes-256-gcm cipher type, each the base64 of 32 bytes
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test run
@@ -140,6 +146,136 @@ testRun(void)
 
         hrnCfgEnvKeyRemoveRaw(cfgOptRepoS3Key, 3);
         hrnCfgEnvKeyRemoveRaw(cfgOptRepoS3KeySecret, 3);
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - the key, the format, and a key used by two repositories");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdArchivePush, argList, .comment = "a key is accepted");
+        TEST_RESULT_UINT(cipherSpecType(cfgCipherSpecMainIdx(0)), cipherTypeAes256Gcm, "cipher type");
+
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList, .comment = "the format follows the cipher when it is not given");
+        TEST_RESULT_UINT(cfgOptionIdxUInt(cfgOptRepoFormat, 0), 7, "format 7");
+
+        hrnCfgArgRawZ(argList, cfgOptRepoFormat, "6");
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdStanzaCreate, argList), OptionInvalidValueError,
+            "'6' is not valid for 'repo1-format' option with 'repo1-cipher-type' option 'aes-256-gcm'\n"
+            "HINT: repository format 7 is written with cipher type aes-256-gcm only.");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, "correct horse battery staple");
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdArchivePush, argList), OptionInvalidValueError,
+            "'repo1-cipher-pass' option must be the base64 of exactly 32 random bytes\n"
+            "HINT: generate a key with 'openssl rand -base64 32'.");
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#else
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm is refused before OpenSSL 3.0.8");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdArchivePush, argList), OptionInvalidValueError,
+            "'aes-256-gcm' is not valid for 'repo1-cipher-type' option\n"
+            "HINT: cipher type aes-256-gcm requires OpenSSL 3.0.8 or later.");
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
+
+        // Format 7 is only for aes-256-gcm
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Cbc);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, "passphrase");
+        hrnCfgArgRawZ(argList, cfgOptRepoFormat, "7");
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdStanzaCreate, argList), OptionInvalidValueError,
+            "'7' is not valid for 'repo1-format' option with 'repo1-cipher-type' option 'aes-256-cbc'\n"
+            "HINT: repository format 7 is written with cipher type aes-256-gcm only.");
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        // The cipher of a repository on a repository host may be configured on that host only, so the check waits until the cipher
+        // is fetched from the host, when it is run again (see protocolRemoteGet())
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgRawZ(argList, cfgOptRepoHost, "repo-host");
+        hrnCfgArgRawZ(argList, cfgOptRepoFormat, "7");
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList, .comment = "the cipher of a remote repository is checked when it is fetched");
+
+        TEST_ERROR(
+            cfgLoadRepoCipher(0, cipherTypeNone, NULL), OptionInvalidValueError,
+            "'7' is not valid for 'repo1-format' option with 'repo1-cipher-type' option 'none'\n"
+            "HINT: repository format 7 is written with cipher type aes-256-gcm only.");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // A cipher fetched from a repository host without its key, which the configuration would not allow locally
+        TEST_ERROR(
+            cfgLoadRepoCipher(0, cipherTypeAes256Gcm, NULL), OptionInvalidValueError,
+            "'repo1-cipher-pass' option must be the base64 of exactly 32 random bytes\n"
+            "HINT: generate a key with 'openssl rand -base64 32'.");
+#endif
+
+        // A cipher configured locally for a remote repository is checked at load
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Cbc);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, "passphrase");
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdStanzaCreate, argList), OptionInvalidValueError,
+            "'7' is not valid for 'repo1-format' option with 'repo1-cipher-type' option 'aes-256-cbc'\n"
+            "HINT: repository format 7 is written with cipher type aes-256-gcm only.");
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // Two repositories may not share a key, and a repository with another cipher in between is not compared
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg1");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 1, "/repo1");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 1, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 2, "/repo2");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 2, cipherTypeAes256Cbc);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 2, "passphrase");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 3, "/repo3");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 3, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 3, TEST_CIPHER_KEY_2);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 4, "/repo4");
+        HRN_CFG_LOAD(cfgCmdArchivePush, argList, .comment = "different keys, and a repository that is not encrypted");
+
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 3, TEST_CIPHER_KEY);
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdArchivePush, argList), OptionInvalidValueError,
+            "'repo1-cipher-pass' and 'repo3-cipher-pass' options must not be the same key");
+
+        // The passphrase of an aes-256-cbc repository is the same key when it is the same text, whichever repository comes first
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 3, TEST_CIPHER_KEY_2);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 2, TEST_CIPHER_KEY);
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdArchivePush, argList), OptionInvalidValueError,
+            "'repo1-cipher-pass' and 'repo2-cipher-pass' options must not be the same key");
+
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 2, TEST_CIPHER_KEY_2);
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdArchivePush, argList), OptionInvalidValueError,
+            "'repo2-cipher-pass' and 'repo3-cipher-pass' options must not be the same key");
+
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 2);
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 3);
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("db-timeout set but not protocol timeout");

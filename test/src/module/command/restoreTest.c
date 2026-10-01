@@ -1,12 +1,15 @@
 /***********************************************************************************************************************************
 Test Restore Command
 ***********************************************************************************************************************************/
+
+#include "command/archive/common.h"
 #include "command/backup/backup.h"
 #include "command/backup/blockIncr.h"
 #include "command/backup/protocol.h"
 #include "command/stanza/create.h"
 #include "common/compress/helper.h"
 #include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "postgres/version.h"
 #include "storage/helper.h"
@@ -15,6 +18,7 @@ Test Restore Command
 #include "harness/backup.h"
 #include "harness/blockIncr.h"
 #include "harness/config.h"
+#include "harness/crypto.h"
 #include "harness/info.h"
 #include "harness/manifest.h"
 #include "harness/postgres.h"
@@ -23,6 +27,10 @@ Test Restore Command
 #include "harness/storage.h"
 #include "harness/storageHelper.h"
 #include "harness/time.h"
+
+/***********************************************************************************************************************************
+An aes-256-gcm repository key
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Special string constants
@@ -225,7 +233,8 @@ testRun(void)
         IoWrite *write = ioBufferWriteNew(destination);
 
         ioFilterGroupAdd(
-            ioWriteFilterGroup(write), blockIncrNew(6, 3, 5, 0, 0, 0, NULL, compressFilterP(compressTypeGz, 1, .raw = true), NULL));
+            ioWriteFilterGroup(write), blockIncrNew(
+                6, 3, 5, 0, 0, 0, NULL, compressFilterP(compressTypeGz, 1, .raw = true), cipherSpecNewNone(), NULL, NULL));
         ioWriteOpen(write);
         ioWrite(write, source);
         ioWriteClose(write);
@@ -236,7 +245,16 @@ testRun(void)
             ioBufferReadNewOpen(BUF(bufPtr(destination) + (bufUsed(destination) - (size_t)mapSize), (size_t)mapSize)), 3, 5);
 
         // Perform block delta
-        BlockDelta *blockDelta = blockDeltaNew(blockMap, 3, 5, NULL, cipherSpecNewNone(), compressTypeGz);
+        const CipherSpec *const cipherSpecCbc = cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF(TEST_CIPHER_PASS));
+
+        TEST_ERROR(
+            blockDeltaNew(blockMap, 3, 5, NULL, cipherSpecCbc, NULL, STRDEF("pg_data/test"), compressTypeGz), AssertError,
+            "reference list and manifest name are required to decrypt");
+        TEST_ERROR(
+            blockDeltaNew(blockMap, 3, 5, NULL, cipherSpecCbc, strLstNew(), NULL, compressTypeGz), AssertError,
+            "reference list and manifest name are required to decrypt");
+
+        BlockDelta *blockDelta = blockDeltaNew(blockMap, 3, 5, NULL, cipherSpecNewNone(), NULL, NULL, compressTypeGz);
         const BlockDeltaRead *blockDeltaRead = blockDeltaReadGet(blockDelta, 0);
         IoRead *read = ioBufferReadNewOpen(destination);
 
@@ -304,6 +322,7 @@ testRun(void)
             .zero = false,
             .user = NULL,
             .group = NULL,
+            .manifestFile = repoFile1,
         };
 
         lstAdd(fileList, &file);
@@ -311,11 +330,60 @@ testRun(void)
         TEST_ERROR(
             restoreFile(
                 strNewFmt(STORAGE_REPO_BACKUP "/%s/%s.gz", strZ(repoFileReferenceFull), strZ(repoFile1)), repoIdx, compressTypeGz,
-                0, false, false, false, cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("badpass"), .digest = hashTypeSha1), NULL,
-                fileList),
+                0, false, false, false, cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("badpass"), .digest = hashTypeSha1),
+                repoFileReferenceFull, NULL, fileList),
             ChecksumError,
             "error restoring 'normal': actual checksum 'd1cd8a7d11daa26814b93eb604e1d49ab4b43770' does not match expected checksum"
             " 'ffffffffffffffffffffffffffffffffffffffff'");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("block map is read to the end of its stream");
+
+        // A block incremental file with a byte after its map, inside the size given for the map
+        Buffer *const blockMapFile = bufNew(0);
+        IoWrite *const blockMapWrite = ioBufferWriteNew(blockMapFile);
+        Buffer *const blockMapBlock = bufNew(8192);
+
+        memset(bufPtr(blockMapBlock), 1, bufSize(blockMapBlock));
+        bufUsedSet(blockMapBlock, bufSize(blockMapBlock));
+
+        ioFilterGroupAdd(
+            ioWriteFilterGroup(blockMapWrite), blockIncrNew(8192, 8192, 11, 0, 0, 0, NULL, NULL, cipherSpecNewNone(), NULL, NULL));
+        ioWriteOpen(blockMapWrite);
+        ioWrite(blockMapWrite, blockMapBlock);
+        ioWriteClose(blockMapWrite);
+
+        const uint64_t blockMapSize = pckReadU64P(ioFilterGroupResultP(ioWriteFilterGroup(blockMapWrite), BLOCK_INCR_FILTER_TYPE));
+
+        bufCat(blockMapFile, BUFSTRDEF("X"));
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), zNewFmt(STORAGE_REPO_BACKUP "/%s/pg_data/bi.pgbi", strZ(repoFileReferenceFull)), blockMapFile);
+
+        fileList = lstNewP(sizeof(RestoreFile));
+
+        file = (RestoreFile)
+        {
+            .name = STRDEF("bi"),
+            .checksum = bufNewDecode(encodingHex, STRDEF("ffffffffffffffffffffffffffffffffffffffff")),
+            .size = 8192,
+            .timeModified = 1557432154,
+            .mode = 0600,
+            .offset = bufUsed(blockMapFile) - blockMapSize - 1,
+            .limit = VARUINT64(blockMapSize + 1),
+            .blockIncrMapSize = blockMapSize + 1,
+            .blockIncrSize = 8192,
+            .blockIncrChecksumSize = 11,
+            .manifestFile = STRDEF("pg_data/bi"),
+        };
+
+        lstAdd(fileList, &file);
+
+        TEST_ERROR(
+            restoreFile(
+                strNewFmt(STORAGE_REPO_BACKUP "/%s/pg_data/bi.pgbi", strZ(repoFileReferenceFull)), repoIdx, compressTypeNone, 0,
+                false, false, false, cipherSpecNewNone(), repoFileReferenceFull, strLstNewSplitZ(STRDEF("20190509F"), ","),
+                fileList),
+            FileReadError, "expected EOF but flushed 1 byte(s)");
     }
 
     // *****************************************************************************************************************************
@@ -2159,6 +2227,42 @@ testRun(void)
                 cipherSpecNewNone()),
             DbMismatchError, "backup timeline 6, lsn 0/4ffffff is not in the history of target timeline B\n"
             "HINT: was the target timeline created by promoting from a timeline < latest?");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("timelineVerify() with aes-256-gcm");
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test1"));
+        const Buffer *const historyGcm = BUFSTRDEF("8\t0/4000000\tcomment\n");
+
+        HRN_STORAGE_PUT(
+            storageTest, "repo/archive/test1/18-1/0000000C.history", historyGcm, .cipherSpec = cipherSpecGcm,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|18-1/0000000C.history"));
+        TEST_RESULT_VOID(
+            timelineVerify(
+                storageRepoIdx(0), STRDEF("18-1"), PG_VERSION_12, 8, 0x3FFFFFF, STRDEF("12"), CFGOPTVAL_RESTORE_TYPE_DEFAULT,
+                cipherSpecGcm),
+            "target timeline found");
+
+        HRN_STORAGE_PUT(
+            storageTest, "repo/archive/test1/18-1/0000000D.history", historyGcm, .cipherSpec = cipherSpecGcm,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|18-1/0000000C.history"));
+        TEST_ERROR(
+            timelineVerify(
+                storageRepoIdx(0), STRDEF("18-1"), PG_VERSION_12, 8, 0x3FFFFFF, STRDEF("13"), CFGOPTVAL_RESTORE_TYPE_DEFAULT,
+                cipherSpecGcm),
+            CryptoError, "cipher segment 0 failed authentication");
+
+        HRN_STORAGE_PUT(
+            storageTest, "repo/archive/test1/19-1/0000000C.history", historyGcm, .cipherSpec = cipherSpecGcm,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|18-1/0000000C.history"));
+        TEST_ERROR(
+            timelineVerify(
+                storageRepoIdx(0), STRDEF("19-1"), PG_VERSION_12, 8, 0x3FFFFFF, STRDEF("12"), CFGOPTVAL_RESTORE_TYPE_DEFAULT,
+                cipherSpecGcm),
+            CryptoError, "cipher segment 0 failed authentication");
+#endif
     }
 
     // *****************************************************************************************************************************
@@ -2308,7 +2412,7 @@ testRun(void)
                 storageNewWriteP(storageRepoIdxWrite(0), STRDEF(STORAGE_REPO_BACKUP "/" TEST_LABEL "/" BACKUP_MANIFEST_FILE))));
 
         // Read the manifest, set a cipher passphrase and store it to the encrypted repo
-        Manifest *manifestEncrypted = manifestLoadFile(
+        Manifest *manifestEncrypted = manifestLoadFileP(
             storageRepoIdxWrite(0), STRDEF(STORAGE_REPO_BACKUP "/" TEST_LABEL "/" BACKUP_MANIFEST_FILE),
             cipherSpecNewNone());
         manifestCipherSpecSet(
@@ -2856,7 +2960,8 @@ testRun(void)
             bufUsedSet(fileBuffer, bufSize(fileBuffer));
 
             IoWrite *write = storageWriteIo(storageNewWriteP(storageRepoWrite(), STRDEF(TEST_REPO_PATH "base/1/bi-no-ref.pgbi")));
-            ioFilterGroupAdd(ioWriteFilterGroup(write), blockIncrNew(8192, 8192, 11, 3, 0, 0, NULL, NULL, NULL));
+            ioFilterGroupAdd(
+                ioWriteFilterGroup(write), blockIncrNew(8192, 8192, 11, 3, 0, 0, NULL, NULL, cipherSpecNewNone(), NULL, NULL));
             ioFilterGroupAdd(ioWriteFilterGroup(write), ioSizeNew());
 
             ioWriteOpen(write);
@@ -2878,7 +2983,8 @@ testRun(void)
 
             Buffer *fileUnusedMap = bufNew(0);
             write = ioBufferWriteNew(fileUnusedMap);
-            ioFilterGroupAdd(ioWriteFilterGroup(write), blockIncrNew(8192, 8192, 11, 0, 0, 0, NULL, NULL, NULL));
+            ioFilterGroupAdd(
+                ioWriteFilterGroup(write), blockIncrNew(8192, 8192, 11, 0, 0, 0, NULL, NULL, cipherSpecNewNone(), NULL, NULL));
 
             ioWriteOpen(write);
             ioWrite(write, fileUnused);
@@ -2898,7 +3004,8 @@ testRun(void)
                 ioWriteFilterGroup(write),
                 blockIncrNew(
                     8192, 8192, 11, 3, 0, 0,
-                    BUF(bufPtr(fileUnusedMap) + bufUsed(fileUnusedMap) - fileUnusedMapSize, fileUnusedMapSize), NULL, NULL));
+                    BUF(bufPtr(fileUnusedMap) + bufUsed(fileUnusedMap) - fileUnusedMapSize, fileUnusedMapSize), NULL,
+                    cipherSpecNewNone(), NULL, NULL));
             ioFilterGroupAdd(ioWriteFilterGroup(write), ioSizeNew());
 
             ioWriteOpen(write);
@@ -3619,6 +3726,964 @@ testRun(void)
         TEST_RESULT_LOG_EMPTY_OR_CONTAINS(", bi 128KB/256KB, ");
 
         hrnStorageHelperRepoShimSet(true);
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("cmdBackup() and cmdRestore() with aes-256-gcm"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        hrnStorageHelperRepoShimSet(true);
+
+        // Set log level to detail, which shows the files that are bundled and those stored alone
+        harnessLogLevelSet(logLevelDetail);
+
+        // Replace backup labels since the times are not deterministic, and checksums since they can differ between architectures
+        hrnLogReplaceAdd("\\) checksum [a-f0-9]{40}", "[a-f0-9]{40}$", "SHA1", false);
+        hrnLogReplaceAdd("[0-9]{8}-[0-9]{6}F_[0-9]{8}-[0-9]{6}D", NULL, "DIFF", true);
+        hrnLogReplaceAdd("[0-9]{8}-[0-9]{6}F_[0-9]{8}-[0-9]{6}I", NULL, "INCR", true);
+        hrnLogReplaceAdd("[0-9]{8}-[0-9]{6}F", NULL, "FULL", true);
+
+        const String *pgPath = STRDEF(TEST_PATH "/pg");
+        const String *repoPath = STRDEF(TEST_PATH "/repo");
+
+        // Create stanza
+        StringList *const argListGcm = strLstNew();
+        hrnCfgArgRawZ(argListGcm, cfgOptStanza, "test1");
+        hrnCfgArgRaw(argListGcm, cfgOptRepoPath, repoPath);
+        hrnCfgArgRaw(argListGcm, cfgOptPgPath, pgPath);
+        hrnCfgArgRawStrId(argListGcm, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+
+        StringList *argList = strLstDup(argListGcm);
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        // Created pg_control and PG_VERSION
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+
+        TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+        TEST_RESULT_LOG("P00   INFO: stanza-create for stanza 'test1' on repo1");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("full and diff backup with files bundled and stored alone");
+
+        // Two relations with the same content, too large to be bundled
+        time_t timeBase = time(NULL);
+        Buffer *const relation = bufNew(16 * 1024);
+        memset(bufPtr(relation), 1, bufSize(relation));
+        bufUsedSet(relation, bufSize(relation));
+
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/2", relation, .timeModified = timeBase - 2);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/3", relation, .timeModified = timeBase - 2);
+
+        StringList *const argListBackup = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argListBackup, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawBool(argListBackup, cfgOptRepoBundle, true);
+        hrnCfgArgRawZ(argListBackup, cfgOptRepoBundleLimit, "8KiB");
+        hrnCfgArgRawBool(argListBackup, cfgOptOnline, false);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "full backup");
+        TEST_RESULT_LOG(
+            "P01 DETAIL: backup file " TEST_PATH "/pg/base/1/2 (16KB, 40.00%) checksum [SHA1]\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg/base/1/3 (16KB, 80.00%) checksum [SHA1]\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg/PG_VERSION (bundle 1/0, 2B, 80.00%) checksum [SHA1]\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg/global/pg_control (bundle 1/66, 8KB, 100.00%) checksum [SHA1]\n"
+            "P00   INFO: new backup label = [FULL-1]\n"
+            "P00   INFO: full backup size = 40KB, file total = 4");
+
+        // The diff backup bundles a new file and refers to the files of the full backup
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_PATH_BASE "/1/4", "contents", .timeModified = timeBase - 1);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeDiff);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "diff backup");
+        TEST_RESULT_LOG(
+            "P00   INFO: last backup label = [FULL-1], version = " PROJECT_VERSION "\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg/base/1/4 (bundle 1/0, 8B, 100.00%) checksum [SHA1]\n"
+            "P00 DETAIL: reference pg_data/PG_VERSION to [FULL-1]\n"
+            "P00 DETAIL: reference pg_data/base/1/2 to [FULL-1]\n"
+            "P00 DETAIL: reference pg_data/base/1/3 to [FULL-1]\n"
+            "P00 DETAIL: reference pg_data/global/pg_control to [FULL-1]\n"
+            "P00   INFO: new backup label = [DIFF-1]\n"
+            "P00   INFO: diff backup size = 8B, file total = 5");
+
+        StringList *const backupList = storageListP(
+            storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true, .differential = true));
+        strLstSort(backupList, sortOrderAsc);
+        const String *const backupFull = strLstGet(backupList, 0);
+        const String *const backupDiff = strLstGet(backupList, 1);
+
+        const InfoBackup *const infoBackup = infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain());
+        const Manifest *const manifest = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupDiff)),
+            infoBackupCipherSpec(infoBackup));
+
+        TEST_RESULT_BOOL(manifestData(manifest)->bundleRaw, true, "bundled files are raw at format 7");
+        TEST_RESULT_STR(manifestFileFind(manifest, STRDEF("pg_data/base/1/2")).reference, backupFull, "reference to full");
+        TEST_RESULT_UINT(manifestFileFind(manifest, STRDEF("pg_data/base/1/4")).bundleId, 1, "bundled in diff");
+
+        const String *const relation2 = strNewFmt(STORAGE_REPO_BACKUP "/%s/pg_data/base/1/2.gz", strZ(backupFull));
+        const String *const relation3 = strNewFmt(STORAGE_REPO_BACKUP "/%s/pg_data/base/1/3.gz", strZ(backupFull));
+        const Buffer *const relation2Repo = storageGetP(storageNewReadP(storageRepo(), relation2));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(relation2Repo), 8)), "PGBR007G", "file stored alone has the prefix");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("restore the diff backup");
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore");
+        TEST_RESULT_LOG(
+            "P00   INFO: repo1: restore backup set [DIFF-1]\n"
+            "P00 DETAIL: check '" TEST_PATH "/pg' exists\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/base'\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/base/1'\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/global'\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/base/1/3 (16KB, 39.99%) checksum [SHA1]\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/base/1/2 (16KB, 79.98%) checksum [SHA1]\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/PG_VERSION (bundle [FULL-1]/1/0, 2B, 79.99%) checksum [SHA1]\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/global/pg_control.pgbackrest.tmp (bundle [FULL-1]/1/66, 8KB, 99.98%)"
+            " checksum [SHA1]\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/base/1/4 (bundle 1/0, 8B, 100.00%) checksum [SHA1]\n"
+            "P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings\n"
+            "P00   INFO: write " TEST_PATH "/pg/postgresql.auto.conf\n"
+            "P00 DETAIL: sync path '" TEST_PATH "/pg'\n"
+            "P00 DETAIL: sync path '" TEST_PATH "/pg/base'\n"
+            "P00 DETAIL: sync path '" TEST_PATH "/pg/base/1'\n"
+            "P00   INFO: restore global/pg_control (performed last to ensure aborted restores cannot be started)\n"
+            "P00 DETAIL: sync path '" TEST_PATH "/pg/global'\n"
+            "P00   INFO: restore size = 40KB, file total = 5");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/2"))), relation), true, "base/1/2 restored");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/3"))), relation), true, "base/1/3 restored");
+        TEST_RESULT_STR_Z(
+            strNewBuf(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/4")))), "contents", "base/1/4 restored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("incr backup of a changed file stored alone, and restore");
+
+        // The incr stores base/1/3 again with other content and refers to the other files. The recovery settings written by the
+        // restore are removed so that only base/1/3 has changed.
+        Buffer *const relationIncr = bufNew(16 * 1024);
+        memset(bufPtr(relationIncr), 2, bufSize(relationIncr));
+        bufUsedSet(relationIncr, bufSize(relationIncr));
+
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/3", relationIncr, .timeModified = timeBase);
+        HRN_STORAGE_REMOVE(storagePgWrite(), PG_FILE_POSTGRESQLAUTOCONF, .errorOnMissing = true);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeIncr);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "incr backup");
+        TEST_RESULT_LOG(
+            "P00   INFO: last backup label = [DIFF-1], version = " PROJECT_VERSION "\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg/base/1/3 (16KB, 100.00%) checksum [SHA1]\n"
+            "P00 DETAIL: reference pg_data/PG_VERSION to [FULL-1]\n"
+            "P00 DETAIL: reference pg_data/base/1/2 to [FULL-1]\n"
+            "P00 DETAIL: reference pg_data/base/1/4 to [DIFF-1]\n"
+            "P00 DETAIL: reference pg_data/global/pg_control to [FULL-1]\n"
+            "P00   INFO: new backup label = [INCR-1]\n"
+            "P00   INFO: incr backup size = 16KB, file total = 5");
+
+        StringList *const backupIncrList = storageListP(
+            storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.incremental = true));
+        TEST_RESULT_UINT(strLstSize(backupIncrList), 1, "one incr backup");
+        const String *const backupIncr = strLstGet(backupIncrList, 0);
+
+        const Manifest *const manifestIncr = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupIncr)),
+            infoBackupCipherSpec(infoBackup));
+
+        TEST_RESULT_STR(manifestData(manifestIncr)->backupLabelPrior, backupDiff, "incr is on the diff");
+        TEST_RESULT_PTR(manifestFileFind(manifestIncr, STRDEF("pg_data/base/1/3")).reference, NULL, "base/1/3 stored in incr");
+        TEST_RESULT_STR(manifestFileFind(manifestIncr, STRDEF("pg_data/base/1/2")).reference, backupFull, "base/1/2 in full");
+        TEST_RESULT_STR(manifestFileFind(manifestIncr, STRDEF("pg_data/base/1/4")).reference, backupDiff, "base/1/4 in diff");
+
+        const String *const relation3Incr = strNewFmt(STORAGE_REPO_BACKUP "/%s/pg_data/base/1/3.gz", strZ(backupIncr));
+        const Buffer *const relation3IncrRepo = storageGetP(storageNewReadP(storageRepo(), relation3Incr));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(relation3IncrRepo), 8)), "PGBR007G", "file stored alone has the prefix");
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        harnessLogLevelSet(logLevelWarn);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore incr");
+        TEST_RESULT_LOG("P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/3"))), relationIncr), true,
+            "base/1/3 restored from incr");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/2"))), relation), true,
+            "base/1/2 restored from full");
+        TEST_RESULT_STR_Z(
+            strNewBuf(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/4")))), "contents",
+            "base/1/4 restored from diff");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("a file of the incr under the same name in the full does not decrypt");
+
+        const Buffer *const relation3Repo = storageGetP(storageNewReadP(storageRepo(), relation3));
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relation3), relation3IncrRepo, .comment = "incr base/1/3 in full directory");
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        hrnCfgArgRaw(argList, cfgOptSet, backupFull);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relation3), relation3Repo, .comment = "put back base/1/3 of the full");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("a file with the same content under the name of another does not decrypt");
+
+        harnessLogLevelSet(logLevelDetail);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        hrnCfgArgRaw(argList, cfgOptSet, backupDiff);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(relation2), storageGetP(storageNewReadP(storageRepo(), relation3)),
+            .comment = "base/1/3's bytes under base/1/2's name");
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+        TEST_RESULT_LOG(
+            "P00   INFO: repo1: restore backup set [DIFF-1]\n"
+            "P00 DETAIL: check '" TEST_PATH "/pg' exists\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/base'\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/base/1'\n"
+            "P00 DETAIL: create path '" TEST_PATH "/pg/global'\n"
+            "P01 DETAIL: restore file " TEST_PATH "/pg/base/1/3 (16KB, 39.99%) checksum [SHA1]");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("block incremental full and diff backup and restore");
+
+        // The files restored show that the backups are right, so only warnings are logged
+        harnessLogLevelSet(logLevelWarn);
+
+        // A relation whose blocks all differ, stored alone and uncompressed so that its super blocks have the same stored size
+        Buffer *const relationBlock = bufNew(256 * 1024);
+
+        for (unsigned int blockIdx = 0; blockIdx < 32; blockIdx++)
+            memset(bufPtr(relationBlock) + blockIdx * 8192, (int)blockIdx + 1, 8192);
+
+        bufUsedSet(relationBlock, bufSize(relationBlock));
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/5", relationBlock, .timeModified = timeBase - 1);
+
+        StringList *const argListBlock = strLstDup(argListBackup);
+        hrnCfgArgRawBool(argListBlock, cfgOptRepoBlock, true);
+        hrnCfgArgRawZ(argListBlock, cfgOptRepoBlockSizeSuperFull, "32KiB");
+        hrnCfgArgRawZ(argListBlock, cfgOptRepoBlockSizeSuper, "32KiB");
+        hrnCfgArgRawZ(argListBlock, cfgOptCompressType, "none");
+
+        argList = strLstDup(argListBlock);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "full backup");
+
+        // Change one block so the diff backup writes one super block and a map that refers to the super blocks of the full
+        memset(bufPtr(relationBlock) + 3 * 8192, 0xFF, 8192);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/5", relationBlock, .timeModified = timeBase);
+
+        argList = strLstDup(argListBlock);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeDiff);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "diff backup");
+
+        StringList *const backupBlockList = storageListP(
+            storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true));
+        strLstSort(backupBlockList, sortOrderDesc);
+        const String *const backupBlockFull = strLstGet(backupBlockList, 0);
+        const Manifest *const manifestBlockFull = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupBlockFull)),
+            infoBackupCipherSpec(infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain())));
+        const ManifestFile fileBlockFull = manifestFileFind(manifestBlockFull, STRDEF("pg_data/base/1/5"));
+
+        TEST_RESULT_BOOL(fileBlockFull.blockIncrMapSize != 0, true, "block incremental in full");
+        TEST_RESULT_UINT(fileBlockFull.bundleId, 0, "stored alone in full");
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore");
+        TEST_RESULT_LOG("P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/5"))), relationBlock), true,
+            "base/1/5 restored from the super blocks of both backups");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("block incremental delta restore");
+
+        // Change two blocks of the restored file so that delta restores only those
+        Buffer *const relationChanged = bufDup(relationBlock);
+        memset(bufPtr(relationChanged), 0xEE, 8192);
+        memset(bufPtr(relationChanged) + 20 * 8192, 0xEE, 8192);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/5", relationChanged);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        hrnCfgArgRawBool(argList, cfgOptDelta, true);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        harnessLogLevelSet(logLevelDetail);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "delta restore");
+        TEST_RESULT_LOG_EMPTY_OR_CONTAINS("/256KB, ");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/5"))), relationBlock), true,
+            "base/1/5 restored by delta");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("a super block moved to the offset of another does not decrypt");
+
+        harnessLogLevelSet(logLevelWarn);
+
+        // All super blocks of the full have the same stored size, so the first two can be swapped without changing the map
+        const String *const relationBlockFull = backupFileRepoPathP(
+            backupBlockFull, .manifestName = STRDEF("pg_data/base/1/5"), .blockIncr = true);
+        Buffer *const relationBlockRepo = storageGetP(storageNewReadP(storageRepo(), relationBlockFull));
+        const size_t superBlockSize = (size_t)(fileBlockFull.sizeRepo - fileBlockFull.blockIncrMapSize) / 8;
+        Buffer *const superBlock0 = bufNewC(bufPtr(relationBlockRepo), superBlockSize);
+
+        memmove(bufPtr(relationBlockRepo), bufPtr(relationBlockRepo) + superBlockSize, superBlockSize);
+        memcpy(bufPtr(relationBlockRepo) + superBlockSize, bufPtr(superBlock0), superBlockSize);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationBlockFull), relationBlockRepo, .comment = "swap super blocks 0 and 1");
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+
+        hrnLogReplaceClear();
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("cmdBackup() and cmdRestore() with aes-256-gcm and a repository that was tampered with"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        hrnStorageHelperRepoShimSet(true);
+
+        // The errors show what a restore does with each file, so only warnings are logged
+        harnessLogLevelSet(logLevelWarn);
+
+        // Replace backup labels since the times are not deterministic
+        hrnLogReplaceAdd("[0-9]{8}-[0-9]{6}F", NULL, "FULL", true);
+
+        const String *pgPath = STRDEF(TEST_PATH "/pg");
+        const String *repoPath = STRDEF(TEST_PATH "/repo");
+        const size_t segmentSize = 1024 * 1024;
+        const time_t timeBase = time(NULL);
+
+        // Create stanza
+        StringList *const argListGcm = strLstNew();
+        hrnCfgArgRawZ(argListGcm, cfgOptStanza, "test1");
+        hrnCfgArgRaw(argListGcm, cfgOptRepoPath, repoPath);
+        hrnCfgArgRaw(argListGcm, cfgOptPgPath, pgPath);
+        hrnCfgArgRawStrId(argListGcm, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+
+        StringList *argList = strLstDup(argListGcm);
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        // Create pg_control and PG_VERSION
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+
+        TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+
+        // Files are not compressed so that the size a file is stored with only depends on its size
+        StringList *const argListBackup = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argListBackup, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawBool(argListBackup, cfgOptRepoBundle, true);
+        hrnCfgArgRawZ(argListBackup, cfgOptCompressType, "none");
+        hrnCfgArgRawBool(argListBackup, cfgOptOnline, false);
+
+        StringList *const argListRestore = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argListRestore, cfgOptSpoolPath, TEST_PATH "/spool");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("a file cut at a cipher segment boundary, extended, or changed fails the restore");
+
+        // A relation too large to be bundled, stored in three cipher segments, and two files of the same size that are bundled.
+        // The files of a bundle are stored from the smallest to the largest, so these two are stored after pg_control.
+        Buffer *const relation = bufNew(2 * segmentSize + 512 * 1024);
+
+        for (size_t byteIdx = 0; byteIdx < bufSize(relation); byteIdx++)
+            bufPtr(relation)[byteIdx] = (uint8_t)(byteIdx * 31 + (byteIdx >> 8));
+
+        bufUsedSet(relation, bufSize(relation));
+
+        Buffer *const file3Content = bufNew(HRN_PG_CONTROL_SIZE + 1024);
+        memset(bufPtr(file3Content), 3, bufSize(file3Content));
+        bufUsedSet(file3Content, bufSize(file3Content));
+
+        Buffer *const file4Content = bufNew(HRN_PG_CONTROL_SIZE + 1024);
+        memset(bufPtr(file4Content), 4, bufSize(file4Content));
+        bufUsedSet(file4Content, bufSize(file4Content));
+
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/2", relation, .timeModified = timeBase - 50);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/3", file3Content, .timeModified = timeBase - 40);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/4", file4Content, .timeModified = timeBase - 30);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "full backup");
+
+        const String *const backupFull = strLstGet(
+            storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true)), 0);
+        const CipherSpec *const cipherSpecBackup = infoBackupCipherSpec(
+            infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain()));
+        const Manifest *const manifestFull = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupFull)), cipherSpecBackup);
+        const String *const relationRepo = backupFileRepoPathP(backupFull, .manifestName = STRDEF("pg_data/base/1/2"));
+        const Buffer *const relationStored = storageGetP(storageNewReadP(storageRepo(), relationRepo));
+
+        TEST_RESULT_UINT(manifestFileFind(manifestFull, STRDEF("pg_data/base/1/2")).bundleId, 0, "relation stored alone");
+        TEST_RESULT_UINT(bufUsed(relationStored), 8 + 40 + bufUsed(relation) + 16 * 3, "relation stored as three cipher segments");
+
+        HRN_CFG_LOAD(cfgCmdRestore, argListRestore);
+
+        // Each change is made to the relation as it was stored
+        const struct
+        {
+            const char *comment;                                    // What is done to the stored file
+            size_t size;                                            // Size the stored file is cut or extended to
+            size_t flip;                                            // Offset of a byte to flip a bit in, when not 0
+            const char *error;                                      // Error expected
+        } tamperList[] =
+        {
+            {"cut after the first cipher segment", 8 + segmentSize, 0, "cipher segment 0 failed authentication"},
+            {"cut after the second cipher segment", 8 + 2 * segmentSize, 0, "cipher segment 1 failed authentication"},
+            {"cut inside the third cipher segment", bufUsed(relationStored) - 1, 0, "cipher segment 2 failed authentication"},
+            {"cut after the cipher header", 8 + 40, 0, "cipher stream is truncated"},
+            {"one byte appended", bufUsed(relationStored) + 1, 0, "cipher segment 2 failed authentication"},
+            {"bit flipped in the salt", bufUsed(relationStored), 8 + 1, "cipher segment 0 failed authentication"},
+            {"bit flipped in the second cipher segment", bufUsed(relationStored), 8 + segmentSize + 100,
+             "cipher segment 1 failed authentication"},
+            {"bit flipped in the last tag", bufUsed(relationStored), bufUsed(relationStored) - 1,
+             "cipher segment 2 failed authentication"},
+        };
+
+        for (unsigned int tamperIdx = 0; tamperIdx < LENGTH_OF(tamperList); tamperIdx++)
+        {
+            Buffer *const tamper = bufNew(bufUsed(relationStored) + 1);
+
+            memset(bufPtr(tamper), 0, bufSize(tamper));
+            memcpy(
+                bufPtr(tamper), bufPtrConst(relationStored),
+                tamperList[tamperIdx].size < bufUsed(relationStored) ? tamperList[tamperIdx].size : bufUsed(relationStored));
+            bufUsedSet(tamper, tamperList[tamperIdx].size);
+
+            if (tamperList[tamperIdx].flip != 0)
+                bufPtr(tamper)[tamperList[tamperIdx].flip] ^= 0x01;
+
+            HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationRepo), tamper, .comment = tamperList[tamperIdx].comment);
+            HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+            TEST_ERROR_FMT(
+                hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: %s", tamperList[tamperIdx].error);
+
+            // pg_control is left under its temporary name, so the cluster that was partly restored cannot be started
+            TEST_STORAGE_LIST(storagePg(), "global", "pg_control.pgbackrest.tmp\n");
+        }
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationRepo), relationStored, .comment = "relation as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("bundle files swapped do not decrypt, pg_control keeps temp name");
+
+        const ManifestFile file3 = manifestFileFind(manifestFull, STRDEF("pg_data/base/1/3"));
+        const ManifestFile file4 = manifestFileFind(manifestFull, STRDEF("pg_data/base/1/4"));
+        const ManifestFile fileControl = manifestFileFind(manifestFull, STRDEF("pg_data/global/pg_control"));
+
+        TEST_RESULT_BOOL(file3.bundleId == 1 && file4.bundleId == 1 && fileControl.bundleId == 1, true, "files in one bundle");
+        TEST_RESULT_BOOL(
+            file3.bundleOffset > fileControl.bundleOffset && file4.bundleOffset > file3.bundleOffset, true,
+            "files stored after pg_control");
+        TEST_RESULT_BOOL(
+            file3.sizeRepo == 40 + bufUsed(file3Content) + 16 && file4.sizeRepo == file3.sizeRepo, true,
+            "files stored with one size");
+
+        const String *const bundleRepo = backupFileRepoPathP(backupFull, .bundleId = 1);
+        const Buffer *const bundleStored = storageGetP(storageNewReadP(storageRepo(), bundleRepo));
+        Buffer *bundleTamper = bufDup(bundleStored);
+
+        memcpy(
+            bufPtr(bundleTamper) + file3.bundleOffset, bufPtrConst(bundleStored) + file4.bundleOffset, (size_t)file3.sizeRepo);
+        memcpy(
+            bufPtr(bundleTamper) + file4.bundleOffset, bufPtrConst(bundleStored) + file3.bundleOffset, (size_t)file3.sizeRepo);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleTamper, .comment = "base/1/3 and base/1/4 exchanged");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+
+        // pg_control is stored before the two files, so it was restored before the restore failed. It is left under the name that
+        // the cluster cannot be started with.
+        TEST_STORAGE_LIST(storagePg(), "global", "pg_control.pgbackrest.tmp\n");
+
+        // A bit flipped in a file of the bundle
+        bundleTamper = bufDup(bundleStored);
+        bufPtr(bundleTamper)[file4.bundleOffset + 40] ^= 0x01;
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleTamper, .comment = "bit flipped in base/1/4");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+        TEST_STORAGE_LIST(storagePg(), "global", "pg_control.pgbackrest.tmp\n");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleStored, .comment = "bundle as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("file of one backup in another's bundle does not decrypt");
+
+        // A diff backup in which base/1/4 has other content of the same size. The diff encrypts with the key of the full backup,
+        // so only what a file is bound to tells a file of the one from a file of the other.
+        Buffer *const file4ContentDiff = bufNew(bufSize(file4Content));
+        memset(bufPtr(file4ContentDiff), 5, bufSize(file4ContentDiff));
+        bufUsedSet(file4ContentDiff, bufSize(file4ContentDiff));
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/2", relation, .timeModified = timeBase - 50);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/3", file3Content, .timeModified = timeBase - 40);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/4", file4ContentDiff, .timeModified = timeBase - 20);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeDiff);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "diff backup");
+
+        const String *const backupDiff = strLstGet(
+            storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.differential = true)), 0);
+        const Manifest *const manifestDiff = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupDiff)), cipherSpecBackup);
+        const ManifestFile file4Diff = manifestFileFind(manifestDiff, STRDEF("pg_data/base/1/4"));
+        const String *const bundleDiffRepo = backupFileRepoPathP(backupDiff, .bundleId = 1);
+        const Buffer *const bundleDiffStored = storageGetP(storageNewReadP(storageRepo(), bundleDiffRepo));
+
+        TEST_RESULT_BOOL(
+            bufEq(cipherSpecPass(manifestCipherSpec(manifestDiff)), cipherSpecPass(manifestCipherSpec(manifestFull))), true,
+            "diff encrypts with the key of the full");
+        TEST_RESULT_STR(manifestFileFind(manifestDiff, STRDEF("pg_data/base/1/3")).reference, backupFull, "base/1/3 in the full");
+        TEST_RESULT_BOOL(file4Diff.reference == NULL && file4Diff.bundleId == 1, true, "base/1/4 in the bundle of the diff");
+        TEST_RESULT_UINT(file4Diff.sizeRepo, file4.sizeRepo, "base/1/4 stored with the same size in both");
+
+        // The newer base/1/4, from the diff, in its place in the full
+        bundleTamper = bufDup(bundleStored);
+        memcpy(
+            bufPtr(bundleTamper) + file4.bundleOffset, bufPtrConst(bundleDiffStored) + file4Diff.bundleOffset,
+            (size_t)file4.sizeRepo);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleTamper, .comment = "base/1/4 of the diff in the full");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        argList = strLstDup(argListRestore);
+        hrnCfgArgRaw(argList, cfgOptSet, backupFull);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+        TEST_STORAGE_LIST(storagePg(), "global", "pg_control.pgbackrest.tmp\n");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleStored, .comment = "bundle of the full as it was stored");
+
+        // The older base/1/4, from the full, in its place in the diff, and then base/1/3 of the full in that place
+        argList = strLstDup(argListRestore);
+        hrnCfgArgRaw(argList, cfgOptSet, backupDiff);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        const uint64_t fileOffsetList[] = {file4.bundleOffset, file3.bundleOffset};
+
+        for (unsigned int fileIdx = 0; fileIdx < LENGTH_OF(fileOffsetList); fileIdx++)
+        {
+            bundleTamper = bufDup(bundleDiffStored);
+            memcpy(
+                bufPtr(bundleTamper) + file4Diff.bundleOffset, bufPtrConst(bundleStored) + fileOffsetList[fileIdx],
+                (size_t)file4.sizeRepo);
+            HRN_STORAGE_PUT(
+                storageRepoWrite(), strZ(bundleDiffRepo), bundleTamper,
+                .comment = fileIdx == 0 ? "base/1/4 of the full in the diff" : "base/1/3 of the full as base/1/4 of the diff");
+            HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+            TEST_ERROR(
+                hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+            TEST_RESULT_BOOL(
+                storageExistsP(storagePg(), STRDEF(PG_PATH_GLOBAL "/" PG_FILE_PGCONTROL)), false, "no pg_control");
+        }
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleDiffRepo), bundleDiffStored, .comment = "bundle as it was stored");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore once the bundle is as it was stored");
+        TEST_RESULT_LOG("P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/4"))), file4ContentDiff), true,
+            "base/1/4 restored");
+        TEST_STORAGE_LIST(storagePg(), "global", "pg_control\n");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("changed or other backup's manifest stops restore before a write");
+
+        const String *const manifestDiffRepo = strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupDiff));
+        const Buffer *const manifestDiffStored = storageGetP(storageNewReadP(storageRepo(), manifestDiffRepo));
+        Buffer *const manifestTamper = bufDup(manifestDiffStored);
+
+        bufPtr(manifestTamper)[bufUsed(manifestTamper) - 1] ^= 0x01;
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(manifestDiffRepo), manifestTamper, .comment = "bit flipped in the manifest");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR_FMT(
+            hrnCmdRestore(), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/repo/backup/test1/%s/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?",
+            strZ(backupDiff));
+        TEST_RESULT_BOOL(storagePathExistsP(storagePg(), NULL), false, "nothing restored");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(manifestDiffRepo),
+            storageGetP(
+                storageNewReadP(
+                    storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupFull)))),
+            .comment = "manifest of the full");
+
+        TEST_ERROR_FMT(
+            hrnCmdRestore(), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/repo/backup/test1/%s/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?",
+            strZ(backupDiff));
+        TEST_RESULT_BOOL(storagePathExistsP(storagePg(), NULL), false, "nothing restored");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(manifestDiffRepo), manifestDiffStored, .comment = "manifest as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("bit flipped in a super block or block map fails the restore");
+
+        // A relation whose blocks all differ, stored alone in eight super blocks and a block map
+        Buffer *const relationBlock = bufNew(256 * 1024);
+
+        for (unsigned int blockIdx = 0; blockIdx < 32; blockIdx++)
+            memset(bufPtr(relationBlock) + blockIdx * 8192, (int)blockIdx + 1, 8192);
+
+        bufUsedSet(relationBlock, bufSize(relationBlock));
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/5", relationBlock, .timeModified = timeBase - 50);
+
+        argList = strLstDup(argListBackup);
+        hrnCfgArgRawZ(argList, cfgOptRepoBundleLimit, "8KiB");
+        hrnCfgArgRawBool(argList, cfgOptRepoBlock, true);
+        hrnCfgArgRawZ(argList, cfgOptRepoBlockSizeSuperFull, "32KiB");
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "full backup");
+
+        const String *const backupBlock = strLstGet(
+            strLstSort(
+                storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true)), sortOrderDesc),
+            0);
+        const ManifestFile fileBlock = manifestFileFind(
+            manifestLoadFileP(
+                storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupBlock)), cipherSpecBackup),
+            STRDEF("pg_data/base/1/5"));
+
+        TEST_RESULT_BOOL(fileBlock.blockIncrMapSize != 0, true, "block incremental");
+        TEST_RESULT_UINT(fileBlock.bundleId, 0, "stored alone");
+
+        const String *const relationBlockRepo = backupFileRepoPathP(
+            backupBlock, .manifestName = STRDEF("pg_data/base/1/5"), .blockIncr = true);
+        const Buffer *const relationBlockStored = storageGetP(storageNewReadP(storageRepo(), relationBlockRepo));
+        const size_t superBlockSize = (size_t)(fileBlock.sizeRepo - fileBlock.blockIncrMapSize) / 8;
+
+        TEST_RESULT_UINT(superBlockSize, 40 + 32 * 1024 + 16, "each super block is one cipher stream of one segment");
+
+        argList = strLstDup(argListRestore);
+        hrnCfgArgRaw(argList, cfgOptSet, backupBlock);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        // A byte of the first and of the last super block, of their salt, ciphertext, and tag, and the same of the block map
+        const size_t flipBlockList[] =
+        {
+            1, 40, superBlockSize - 1, 7 * superBlockSize + 1, 7 * superBlockSize + 40, 8 * superBlockSize - 1,
+            8 * superBlockSize + 1, 8 * superBlockSize + 40, (size_t)fileBlock.sizeRepo - 1,
+        };
+
+        for (unsigned int flipIdx = 0; flipIdx < LENGTH_OF(flipBlockList); flipIdx++)
+        {
+            Buffer *const tamper = bufDup(relationBlockStored);
+
+            bufPtr(tamper)[flipBlockList[flipIdx]] ^= 0x01;
+            HRN_STORAGE_PUT(
+                storageRepoWrite(), strZ(relationBlockRepo), tamper,
+                .comment = zNewFmt("bit flipped in byte %zu", flipBlockList[flipIdx]));
+            HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+            TEST_ERROR(
+                hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+            TEST_STORAGE_LIST(storagePg(), "global", "pg_control.pgbackrest.tmp\n");
+        }
+
+        // The block map in the place of a super block, and cut short by the size of a super block so the file has the same size
+        Buffer *const tamperMap = bufDup(relationBlockStored);
+
+        memcpy(
+            bufPtr(tamperMap), bufPtrConst(relationBlockStored) + 8 * superBlockSize,
+            (size_t)fileBlock.blockIncrMapSize < superBlockSize ? (size_t)fileBlock.blockIncrMapSize : superBlockSize);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationBlockRepo), tamperMap, .comment = "block map over super block 0");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR(hrnCmdRestore(), CryptoError, "raised from local-1 shim protocol: cipher segment 0 failed authentication");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationBlockRepo), relationBlockStored, .comment = "file as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("file from before a resume decrypts but fails its checksum");
+
+        // A backup that stops after it has stored base/1/6, because base/1/7 cannot be read. Both are too large to be bundled.
+        Buffer *const fileAborted = bufNew(16 * 1024);
+        memset(bufPtr(fileAborted), 0x11, bufSize(fileAborted));
+        bufUsedSet(fileAborted, bufSize(fileAborted));
+
+        Buffer *const fileResumed = bufNew(16 * 1024);
+        memset(bufPtr(fileResumed), 0x22, bufSize(fileResumed));
+        bufUsedSet(fileResumed, bufSize(fileResumed));
+
+        Buffer *const fileUnreadable = bufNew(12 * 1024);
+        memset(bufPtr(fileUnreadable), 0x33, bufSize(fileUnreadable));
+        bufUsedSet(fileUnreadable, bufSize(fileUnreadable));
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/6", fileAborted, .timeModified = timeBase - 50);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/7", fileUnreadable, .timeModified = timeBase - 50);
+        HRN_STORAGE_MODE(storagePgWrite(), PG_PATH_BASE "/1/7", .mode = 0200);
+
+        StringList *const argListResume = strLstDup(argListBackup);
+        hrnCfgArgRawZ(argListResume, cfgOptRepoBundleLimit, "8KiB");
+        hrnCfgArgRawStrId(argListResume, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argListResume);
+
+        TEST_ERROR(
+            hrnCmdBackup(), FileOpenError,
+            "raised from local-1 shim protocol: unable to open file '" TEST_PATH "/pg/base/1/7' for read: [13] Permission denied");
+
+        const String *const backupResume = strLstGet(
+            strLstSort(
+                storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true)), sortOrderDesc),
+            0);
+        const String *const fileResumeRepo = backupFileRepoPathP(backupResume, .manifestName = STRDEF("pg_data/base/1/6"));
+
+        TEST_RESULT_BOOL(strEq(backupResume, backupBlock), false, "another label");
+        TEST_STORAGE_LIST(
+            storageRepo(), zNewFmt(STORAGE_REPO_BACKUP "/%s", strZ(backupResume)),
+            "backup.manifest.copy\n"
+            "bundle/\n"
+            "bundle/1\n"
+            "pg_data/\n"
+            "pg_data/base/\n"
+            "pg_data/base/1/\n"
+            "pg_data/base/1/6\n",
+            .comment = "the backup stopped without base/1/7 or its manifest");
+
+        const Buffer *const fileAbortedStored = storageGetP(storageNewReadP(storageRepo(), fileResumeRepo));
+
+        // The file that was stored changes and the other file can be read, so the backup is resumed and stores the file again,
+        // under the label and the name it had. Both versions are bound to the same identity.
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/6", fileResumed, .timeModified = timeBase - 40);
+        HRN_STORAGE_MODE(storagePgWrite(), PG_PATH_BASE "/1/7");
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "resume backup");
+        TEST_RESULT_LOG(
+            "P00   WARN: resumable backup [FULL-1] of same type exists -- invalid files will be removed then the backup will"
+            " resume");
+
+        TEST_RESULT_STR(
+            strLstGet(
+                strLstSort(
+                    storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true)),
+                    sortOrderDesc),
+                0),
+            backupResume, "the backup kept its label");
+        TEST_RESULT_BOOL(
+            storageExistsP(storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupResume))), true,
+            "the backup is complete");
+
+        const Buffer *const fileResumedStored = storageGetP(storageNewReadP(storageRepo(), fileResumeRepo));
+
+        TEST_RESULT_UINT(bufUsed(fileResumedStored), bufUsed(fileAbortedStored), "stored with the same size");
+        TEST_RESULT_BOOL(bufEq(fileResumedStored, fileAbortedStored), false, "stored again");
+
+        argList = strLstDup(argListRestore);
+        hrnCfgArgRaw(argList, cfgOptSet, backupResume);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore");
+        TEST_RESULT_LOG("P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/6"))), fileResumed), true, "base/1/6 restored");
+
+        // The cipher cannot tell the version stored first from the one stored on resume. The checksum in the manifest, which is
+        // itself bound to the backup, can.
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(fileResumeRepo), fileAbortedStored, .comment = "file stored before the resume");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR_FMT(
+            hrnCmdRestore(), ChecksumError,
+            "raised from local-1 shim protocol: error restoring '" TEST_PATH "/pg/base/1/6': actual checksum '%s' does not match"
+            " expected checksum '%s'",
+            strZ(strNewEncode(encodingHex, cryptoHashOne(hashTypeSha1, fileAborted))),
+            strZ(strNewEncode(encodingHex, cryptoHashOne(hashTypeSha1, fileResumed))));
+        TEST_RESULT_BOOL(storageExistsP(storagePg(), STRDEF(PG_PATH_GLOBAL "/" PG_FILE_PGCONTROL)), false, "no pg_control");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(fileResumeRepo), fileResumedStored, .comment = "file as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("bundle from before a resume decrypts but fails its checksum");
+
+        // A block incremental relation that fills the first bundle, and a second bundle that cannot be written because a file in it
+        // cannot be read. Files are bundled from the oldest to the newest.
+        Buffer *const relationAborted = bufNew(segmentSize);
+
+        for (unsigned int blockIdx = 0; blockIdx < 128; blockIdx++)
+            memset(bufPtr(relationAborted) + blockIdx * 8192, (int)blockIdx + 1, 8192);
+
+        bufUsedSet(relationAborted, bufSize(relationAborted));
+
+        Buffer *const relationResumed = bufDup(relationAborted);
+        memset(bufPtr(relationResumed) + 5 * 8192, 0xFF, 8192);
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+        HRN_PG_CONTROL_TIME(storagePgWrite(), timeBase - 50);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_15_Z, .timeModified = timeBase - 50);
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/8", relationAborted, .timeModified = timeBase - 60);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_PATH_BASE "/1/9", "contents", .timeModified = timeBase - 40);
+        HRN_STORAGE_MODE(storagePgWrite(), PG_PATH_BASE "/1/9", .mode = 0200);
+
+        StringList *const argListResumeBlock = strLstDup(argListBackup);
+        hrnCfgArgRawZ(argListResumeBlock, cfgOptRepoBundleSize, "1MiB");
+        hrnCfgArgRawBool(argListResumeBlock, cfgOptRepoBlock, true);
+        hrnCfgArgRawStrId(argListResumeBlock, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argListResumeBlock);
+
+        TEST_ERROR(
+            hrnCmdBackup(), FileOpenError,
+            "raised from local-1 shim protocol: unable to open file '" TEST_PATH "/pg/base/1/9' for read: [13] Permission denied");
+
+        const String *const backupResumeBlock = strLstGet(
+            strLstSort(
+                storageListP(storageRepo(), STORAGE_REPO_BACKUP_STR, .expression = backupRegExpP(.full = true)), sortOrderDesc),
+            0);
+        const String *const bundleResumeRepo = backupFileRepoPathP(backupResumeBlock, .bundleId = 1);
+
+        TEST_RESULT_BOOL(strEq(backupResumeBlock, backupResume), false, "another label");
+
+        const Buffer *const bundleAbortedStored = storageGetP(storageNewReadP(storageRepo(), bundleResumeRepo));
+
+        // A block of the relation changes and the other file can be read, so the backup is resumed and writes the bundle again
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/8", relationResumed, .timeModified = timeBase - 59);
+        HRN_STORAGE_MODE(storagePgWrite(), PG_PATH_BASE "/1/9");
+
+        TEST_RESULT_VOID(hrnCmdBackup(), "resume backup");
+        TEST_RESULT_LOG(
+            "P00   WARN: resumable backup [FULL-2] of same type exists -- invalid files will be removed then the backup will"
+            " resume");
+
+        const ManifestFile fileResumeBlock = manifestFileFind(
+            manifestLoadFileP(
+                storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupResumeBlock)),
+                cipherSpecBackup),
+            STRDEF("pg_data/base/1/8"));
+        const Buffer *const bundleResumedStored = storageGetP(storageNewReadP(storageRepo(), bundleResumeRepo));
+
+        TEST_RESULT_BOOL(fileResumeBlock.blockIncrMapSize != 0, true, "block incremental");
+        TEST_RESULT_UINT(fileResumeBlock.bundleId, 1, "in the first bundle");
+        TEST_RESULT_UINT(fileResumeBlock.bundleOffset, 0, "at the start of the bundle");
+        TEST_RESULT_UINT(fileResumeBlock.sizeRepo, bufUsed(bundleResumedStored), "alone in the bundle");
+        TEST_RESULT_UINT(bufUsed(bundleResumedStored), bufUsed(bundleAbortedStored), "bundle written with the same size");
+        TEST_RESULT_BOOL(bufEq(bundleResumedStored, bundleAbortedStored), false, "bundle written again");
+
+        argList = strLstDup(argListRestore);
+        hrnCfgArgRaw(argList, cfgOptSet, backupResumeBlock);
+        HRN_CFG_LOAD(cfgCmdRestore, argList);
+
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_RESULT_VOID(hrnCmdRestore(), "restore");
+        TEST_RESULT_LOG("P00   WARN: postgresql.auto.conf does not exist -- creating to contain recovery settings");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF(PG_PATH_BASE "/1/8"))), relationResumed), true,
+            "base/1/8 restored");
+
+        // The super blocks and the block map of the bundle written first are bound to the label, the name, and the offsets that
+        // those of the bundle written on resume are bound to, since the bundle is not part of what they are bound to. The relation
+        // they give is the one before the resume, which does not have the checksum in the manifest.
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(bundleResumeRepo), bundleAbortedStored, .comment = "bundle written before the resume");
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), NULL, .recurse = true);
+
+        TEST_ERROR_FMT(
+            hrnCmdRestore(), ChecksumError,
+            "raised from local-1 shim protocol: error restoring '" TEST_PATH "/pg/base/1/8': actual checksum '%s' does not match"
+            " expected checksum '%s'",
+            strZ(strNewEncode(encodingHex, cryptoHashOne(hashTypeSha1, relationAborted))),
+            strZ(strNewEncode(encodingHex, cryptoHashOne(hashTypeSha1, relationResumed))));
+        TEST_RESULT_BOOL(storageExistsP(storagePg(), STRDEF(PG_PATH_GLOBAL "/" PG_FILE_PGCONTROL)), false, "no pg_control");
+
+        hrnLogReplaceClear();
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

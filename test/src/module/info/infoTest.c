@@ -1,7 +1,9 @@
 /***********************************************************************************************************************************
 Test Info Handler
 ***********************************************************************************************************************************/
+
 #include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/format/cipherBlockFormat.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
@@ -117,20 +119,20 @@ testRun(void)
             infoNewLoad(ioBufferReadNew(contentLoad), cipherSpecNewNone(), harnessInfoLoadNewCallback, callbackContent),
             FormatError,
             "repository format 4 is no longer supported by pgBackRest\n"
-            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 6.");
+            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 7.");
         TEST_RESULT_STR_Z(callbackContent, "", "    check callback content");
 
         // Format newer than supported
         // -------------------------------------------------------------------------------------------------------------------------
         contentLoad = BUFSTRDEF(
             "[backrest]\n"
-            "backrest-format=7\n");
+            "backrest-format=8\n");
 
         TEST_ERROR(
             infoNewLoad(ioBufferReadNew(contentLoad), cipherSpecNewNone(), harnessInfoLoadNewCallback, callbackContent),
             FormatError,
-            "repository format 7 requires a newer version of pgBackRest\n"
-            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 6.");
+            "repository format 8 requires a newer version of pgBackRest\n"
+            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 7.");
 
         // Checksum not found
         // -------------------------------------------------------------------------------------------------------------------------
@@ -309,6 +311,48 @@ testRun(void)
         TEST_RESULT_UINT(infoFormat(info), REPOSITORY_FORMAT_6, "    check format");
         TEST_RESULT_UINT(cipherSpecDigest(infoCipherSpec(info)), hashTypeSha1, "    check cipher sub digest unchanged");
 
+#ifdef CIPHER_GCM_SUPPORTED
+        // Format 7 records the cipher instead of a digest, and the recorded cipher must be the one the file was opened with
+        // -------------------------------------------------------------------------------------------------------------------------
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF("key"), .digest = hashTypeSha256, .stanza = STRDEF("demo"));
+
+        contentSave = bufNew(0);
+
+        TEST_RESULT_VOID(
+            infoSave(
+                infoNew(REPOSITORY_FORMAT_7, cipherSpecGcm), ioBufferWriteNew(contentSave), testInfoSaveCallback, strNewZ("1")),
+            "save format 7");
+        TEST_RESULT_BOOL(strstr(strZ(strNewBuf(contentSave)), "cipher-type=\"aes-256-gcm\"") != NULL, true, "    cipher recorded");
+        TEST_RESULT_BOOL(strstr(strZ(strNewBuf(contentSave)), "cipher-digest") == NULL, true, "    no digest");
+
+        TEST_ASSIGN(
+            info, infoNewLoad(ioBufferReadNew(contentSave), cipherSpecGcm, harnessInfoLoadNewCallback, strNew()), "load format 7");
+        TEST_RESULT_UINT(infoFormat(info), REPOSITORY_FORMAT_7, "    check format");
+        TEST_RESULT_STR_Z(cipherSpecStanza(infoCipherSpec(info)), "demo", "    pass is bound to the stanza of the spec");
+
+        TEST_ERROR(
+            infoNewLoad(
+                ioBufferReadNew(contentSave), cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("pass")), harnessInfoLoadNewCallback,
+                strNew()),
+            CryptoError,
+            "file cipher type 'aes-256-gcm' does not match configured cipher type 'aes-256-cbc'\n"
+            "HINT: is or was the repo encrypted?");
+
+        TEST_ERROR(
+            infoNewLoad(
+                ioBufferReadNew(harnessInfoChecksumFormat(REPOSITORY_FORMAT_7, STRDEF("[cipher]\ncipher-pass=\"key\"\n"))),
+                cipherSpecGcm, harnessInfoLoadNewCallback, strNew()),
+            FormatError, "cipher type not found in repository format 7");
+
+        // Without the pass the dependent files would be written without encryption
+        TEST_ERROR(
+            infoNewLoad(
+                ioBufferReadNew(harnessInfoChecksumFormat(REPOSITORY_FORMAT_7, STRDEF("[cipher]\ncipher-type=\"aes-256-gcm\"\n"))),
+                cipherSpecGcm, harnessInfoLoadNewCallback, strNew()),
+            FormatError, "cipher pass not found in repository format 7");
+#endif
+
         // Header
         // -------------------------------------------------------------------------------------------------------------------------
         // An unencrypted file has no header no matter the format, since the format is read from the content
@@ -412,14 +456,14 @@ testRun(void)
 
         // Header names a format this version cannot read, which is reported before anything is decrypted
         contentHeader = harnessInfoEncryptP(contentLoad, cipherSpec, .format = REPOSITORY_FORMAT_6);
-        bufPtr(contentHeader)[6] = '7';
+        bufPtr(contentHeader)[6] = '8';
 
         TEST_ERROR(
             infoNewLoad(
                 testInfoReadHeader(contentHeader, cipherSpec), cipherSpec, harnessInfoLoadNewCallback, callbackContent),
             FormatError,
-            "repository format 7 requires a newer version of pgBackRest\n"
-            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 6.");
+            "repository format 8 requires a newer version of pgBackRest\n"
+            "HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 7.");
 
         // Header and content disagree about the format
         TEST_ERROR(

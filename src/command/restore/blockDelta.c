@@ -4,9 +4,10 @@ Block Restore
 #include <build.h>
 
 #include "command/backup/blockIncr.h"
+#include "command/backup/common.h"
 #include "command/restore/blockDelta.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/limitRead.h"
 #include "common/log.h"
 
@@ -16,6 +17,7 @@ Object type
 typedef struct BlockDeltaSuperBlock
 {
     uint64_t superBlockSize;                                        // Super block size
+    uint64_t offset;                                                // Offset of the super block in the repo file
     uint64_t size;                                                  // Stored size of superblock (with compression, etc.)
     List *blockList;                                                // Block list
 } BlockDeltaSuperBlock;
@@ -33,6 +35,8 @@ struct BlockDelta
     size_t blockSize;                                               // Block size
     size_t checksumSize;                                            // Checksum size
     const CipherSpec *cipherSpecBackup;                             // Cipher spec
+    const StringList *referenceList;                                // Labels of the backups that wrote the super blocks
+    const String *manifestName;                                     // Manifest name the super blocks are bound to
     CompressType compressType;                                      // Compress type
 
     const BlockDeltaSuperBlock *superBlockData;                     // Current super block data
@@ -56,7 +60,8 @@ typedef struct BlockDeltaReference
 FN_EXTERN BlockDelta *
 blockDeltaNew(
     const BlockMap *const blockMap, const size_t blockSize, const size_t checksumSize, const Buffer *const blockChecksum,
-    const CipherSpec *const cipherSpecBackup, const CompressType compressType)
+    const CipherSpec *const cipherSpecBackup, const StringList *const referenceList, const String *const manifestName,
+    const CompressType compressType)
 {
     FUNCTION_TEST_BEGIN();
         FUNCTION_TEST_PARAM(BLOCK_MAP, blockMap);
@@ -64,12 +69,19 @@ blockDeltaNew(
         FUNCTION_TEST_PARAM(SIZE, checksumSize);
         FUNCTION_TEST_PARAM(BUFFER, blockChecksum);
         FUNCTION_TEST_PARAM(CIPHER_SPEC, cipherSpecBackup);
+        FUNCTION_TEST_PARAM(STRING_LIST, referenceList);
+        FUNCTION_TEST_PARAM(STRING, manifestName);
         FUNCTION_TEST_PARAM(ENUM, compressType);
     FUNCTION_TEST_END();
 
     ASSERT(blockMap != NULL);
     ASSERT(blockSize > 0);
     ASSERT(cipherSpecBackup != NULL);
+
+    // The super blocks are bound to the labels and the manifest name, which come from a pack, so check them at run time
+    CHECK(
+        AssertError, cipherSpecType(cipherSpecBackup) == cipherTypeNone || (referenceList != NULL && manifestName != NULL),
+        "reference list and manifest name are required to decrypt");
 
     OBJ_NEW_BEGIN(BlockDelta, .childQty = MEM_CONTEXT_QTY_MAX)
     {
@@ -82,6 +94,8 @@ blockDeltaNew(
             .blockSize = blockSize,
             .checksumSize = checksumSize,
             .cipherSpecBackup = cipherSpecDupP(cipherSpecBackup),
+            .referenceList = strLstDup(referenceList),
+            .manifestName = strDup(manifestName),
             .compressType = compressType,
             .write =
             {
@@ -168,6 +182,7 @@ blockDeltaNew(
                             const BlockDeltaSuperBlock blockDeltaSuperBlockNew =
                             {
                                 .superBlockSize = blockMapItem->superBlockSize,
+                                .offset = blockMapItem->offset,
                                 .size = blockMapItem->size,
                                 .blockList = lstNewP(sizeof(BlockDeltaBlock)),
                             };
@@ -234,11 +249,21 @@ blockDeltaNext(BlockDelta *const this, const BlockDeltaRead *const readDelta, Io
             }
             MEM_CONTEXT_OBJ_END();
 
+            // The super block is bound to the backup that wrote it and to where it begins, as recorded in the block map
             if (cipherSpecType(this->cipherSpecBackup) != cipherTypeNone)
             {
-                ioFilterGroupAdd(
-                    ioReadFilterGroup(this->limitRead), cipherBlockNewP(
-                        cipherModeDecrypt, this->cipherSpecBackup, .header = cipherBlockHeaderNone));
+                MEM_CONTEXT_TEMP_BEGIN()
+                {
+                    ioFilterGroupAdd(
+                        ioReadFilterGroup(this->limitRead),
+                        cipherFormatNewP(
+                            cipherModeDecrypt, this->cipherSpecBackup,
+                            backupSuperBlockCipherIdentity(
+                                strLstGet(this->referenceList, readDelta->reference), this->manifestName,
+                                this->superBlockData->offset),
+                            .raw = true));
+                }
+                MEM_CONTEXT_TEMP_END();
             }
 
             if (this->compressType != compressTypeNone)

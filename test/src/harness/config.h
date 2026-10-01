@@ -17,6 +17,14 @@ Config option constants
 #define TEST_CIPHER_PASS                                            "xmainx"
 #define TEST_CIPHER_PASS_ARCHIVE                                    "xarchivex"
 
+// Keys for aes-256-gcm, each the canonical base64 of 32 bytes. The archive, manifest, and backup keys are subpasses for tests that
+// build a stanza's info files with known subpasses.
+#define TEST_CIPHER_KEY                                             "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+#define TEST_CIPHER_KEY_2                                           "HyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4="
+#define TEST_CIPHER_KEY_ARCHIVE                                     "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+#define TEST_CIPHER_KEY_MANIFEST                                    "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8="
+#define TEST_CIPHER_KEY_BACKUP                                      "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8="
+
 // Cipher spec for a test pass, defaulting to the main pass, since most tests encrypt with that
 #define TEST_CIPHER_SPEC_PASS(pass)                                 cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRZ(pass))
 #define TEST_CIPHER_SPEC                                            TEST_CIPHER_SPEC_PASS(TEST_CIPHER_PASS)

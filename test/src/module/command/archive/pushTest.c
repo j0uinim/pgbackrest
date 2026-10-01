@@ -1,6 +1,11 @@
 /***********************************************************************************************************************************
 Test Archive Push Command
 ***********************************************************************************************************************************/
+
+#include "common/compress/helper.h"
+#include "common/crypto/cipherGcm.h"
+#include "common/format/cipherFormat.h"
+#include "common/io/bufferRead.h"
 #include "common/io/fdRead.h"
 #include "common/io/fdWrite.h"
 #include "common/time.h"
@@ -506,6 +511,79 @@ testRun(void)
 
         // Reset control file
         HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_11);
+#ifdef CIPHER_GCM_SUPPORTED
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - WAL bound to its archive name with extension");
+
+        Buffer *const walGcm = bufNew(1024);
+        bufUsedSet(walGcm, bufSize(walGcm));
+        memset(bufPtr(walGcm), 0xAA, bufSize(walGcm));
+        HRN_PG_WAL_TO_BUFFER(walGcm, PG_VERSION_11);
+        const char *const walGcmSha1 = strZ(strNewEncode(encodingHex, cryptoHashOne(hashTypeSha1, walGcm)));
+        HRN_STORAGE_PUT(storageTest, "pg/pg_wal/000000010000000100000002", walGcm, .comment = "write WAL");
+
+        argListTemp = strLstNew();
+        hrnCfgArgRawZ(argListTemp, cfgOptStanza, "test");
+        hrnCfgArgKeyRawZ(argListTemp, cfgOptPgPath, 1, TEST_PATH "/pg");
+        hrnCfgArgKeyRawZ(argListTemp, cfgOptRepoPath, 1, TEST_PATH "/repo-enc");
+        hrnCfgArgKeyRawStrId(argListTemp, cfgOptRepoCipherType, 1, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+        strLstAddZ(argListTemp, "pg_wal/000000010000000100000002");
+        HRN_CFG_LOAD(cfgCmdArchivePush, argListTemp);
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
+
+        HRN_INFO_PUT(
+            storageRepoIdxWrite(0), INFO_ARCHIVE_PATH_FILE,
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_2 "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":" HRN_PG_SYSTEMID_11_Z ",\"db-version\":\"11\"}",
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test")));
+
+        TEST_RESULT_VOID(cmdArchivePush(), "push the WAL segment");
+        TEST_RESULT_LOG("P00   INFO: pushed WAL file '000000010000000100000002' to the archive");
+
+        const String *const walGcmName = strNewFmt("11-1/0000000100000001/000000010000000100000002-%s.gz", walGcmSha1);
+        const Buffer *const walGcmStored = storageGetP(
+            storageNewReadP(storageTest, strNewFmt("repo-enc/archive/test/%s", strZ(walGcmName))));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(walGcmStored), 8)), "PGBR007G", "format 7 prefix");
+
+        // Decrypt with the subpass and the name the file was stored under, then decompress
+        const CipherSpec *const cipherSpecGcmSub = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_2), .stanza = STRDEF("test"));
+        IoRead *walGcmRead = ioBufferReadNew(walGcmStored);
+
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(walGcmRead), cipherModeDecrypt, cipherSpecGcmSub, archiveCipherIdentity(walGcmName));
+        ioFilterGroupAdd(ioReadFilterGroup(walGcmRead), decompressFilterP(compressTypeGz));
+        ioReadOpen(walGcmRead);
+        TEST_RESULT_BOOL(bufEq(ioReadBuf(walGcmRead), walGcm), true, "decrypts to the WAL");
+
+        // Free the read so the decompression state is freed before a later test forks
+        ioReadFree(walGcmRead);
+
+        // The same bytes under another segment name, or without the compression extension, do not decrypt
+        walGcmRead = ioBufferReadNew(walGcmStored);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(walGcmRead), cipherModeDecrypt, cipherSpecGcmSub,
+            archiveCipherIdentity(strNewFmt("11-1/0000000100000001/000000010000000100000003-%s.gz", walGcmSha1)));
+        ioReadOpen(walGcmRead);
+        TEST_ERROR(ioReadBuf(walGcmRead), CryptoError, "cipher segment 0 failed authentication");
+
+        walGcmRead = ioBufferReadNew(walGcmStored);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(walGcmRead), cipherModeDecrypt, cipherSpecGcmSub,
+            archiveCipherIdentity(strNewFmt("11-1/0000000100000001/000000010000000100000002-%s", walGcmSha1)));
+        ioReadOpen(walGcmRead);
+        TEST_ERROR(ioReadBuf(walGcmRead), CryptoError, "cipher segment 0 failed authentication");
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("multiple repos, one encrypted");
@@ -1265,6 +1343,71 @@ testRun(void)
             "000000010000000100000004.error\n"
             "000000010000000100000005.error\n",
             .comment = "check status files");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm async WAL push");
+
+        HRN_STORAGE_PATH_REMOVE(storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_OUT, .recurse = true);
+        HRN_STORAGE_PATH_CREATE(storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_OUT);
+        HRN_STORAGE_PATH_REMOVE(storagePgWrite(), "pg_xlog/archive_status", .recurse = true);
+        HRN_STORAGE_PATH_CREATE(storagePgWrite(), "pg_xlog/archive_status");
+
+        HRN_STORAGE_PUT(storagePgWrite(), "pg_xlog/000000010000000100000020", walBufferBatch);
+        HRN_STORAGE_PUT_EMPTY(storagePgWrite(), "pg_xlog/archive_status/000000010000000100000020.ready");
+
+        argListTemp = strLstNew();
+        hrnCfgArgRawZ(argListTemp, cfgOptSpoolPath, TEST_PATH "/spool");
+        hrnCfgArgRawZ(argListTemp, cfgOptStanza, "test");
+        hrnCfgArgRawBool(argListTemp, cfgOptArchiveAsync, true);
+        hrnCfgArgRawZ(argListTemp, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgRawZ(argListTemp, cfgOptRepoPath, TEST_PATH "/repo-enc-async");
+        hrnCfgArgRawStrId(argListTemp, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        strLstAddZ(argListTemp, TEST_PATH "/pg/pg_xlog");
+        HRN_CFG_LOAD(cfgCmdArchivePush, argListTemp, .role = cfgCmdRoleAsync);
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        HRN_INFO_PUT(
+            storageRepoIdxWrite(0), INFO_ARCHIVE_PATH_FILE,
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_2 "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":" HRN_PG_SYSTEMID_18_Z ",\"db-version\":\"18\"}",
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test")));
+
+        TEST_RESULT_VOID(cmdArchivePushAsync(), "push WAL segment");
+        TEST_RESULT_LOG(
+            "P00   INFO: push 1 WAL file(s) to archive: 000000010000000100000020\n"
+            "P01 DETAIL: pushed WAL file '000000010000000100000020' to the archive");
+
+        TEST_STORAGE_LIST(
+            storageSpool(), STORAGE_SPOOL_ARCHIVE_OUT, "000000010000000100000020.ok\n", .comment = "check status files");
+
+        // The segment is stored with the format 7 prefix and decrypts, with the name it was stored under, to the WAL
+        const String *const walAsyncGcmName = strNewFmt(
+            "18-1/0000000100000001/000000010000000100000020-%s.gz", walBufferBatchSha1);
+        const Buffer *const walAsyncGcmStored = storageGetP(
+            storageNewReadP(storageTest, strNewFmt("repo-enc-async/archive/test/%s", strZ(walAsyncGcmName))));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(walAsyncGcmStored), 8)), "PGBR007G", "format 7 prefix");
+
+        IoRead *const walAsyncGcmRead = ioBufferReadNew(walAsyncGcmStored);
+
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(walAsyncGcmRead), cipherModeDecrypt,
+            cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_2), .stanza = STRDEF("test")),
+            archiveCipherIdentity(walAsyncGcmName));
+        ioFilterGroupAdd(ioReadFilterGroup(walAsyncGcmRead), decompressFilterP(compressTypeGz));
+        ioReadOpen(walAsyncGcmRead);
+        TEST_RESULT_BOOL(bufEq(ioReadBuf(walAsyncGcmRead), walBufferBatch), true, "decrypts to the WAL");
+        ioReadFree(walAsyncGcmRead);
+#endif
 
         // Uninstall local command handler shim
         hrnProtocolLocalShimUninstall();

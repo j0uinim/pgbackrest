@@ -66,6 +66,7 @@ static const StringPubConst parseRuleValueStr[] =
     PARSE_RULE_STRPUB("6"),                                                                                               // val/str
     PARSE_RULE_STRPUB("64KiB"),                                                                                           // val/str
     PARSE_RULE_STRPUB("65535"),                                                                                           // val/str
+    PARSE_RULE_STRPUB("7"),                                                                                               // val/str
     PARSE_RULE_STRPUB("7d"),                                                                                              // val/str
     PARSE_RULE_STRPUB("8432"),                                                                                            // val/str
     PARSE_RULE_STRPUB("8KiB"),                                                                                            // val/str
@@ -76,6 +77,7 @@ static const StringPubConst parseRuleValueStr[] =
     PARSE_RULE_STRPUB("9999999"),                                                                                         // val/str
     PARSE_RULE_STRPUB("accept-new"),                                                                                      // val/str
     PARSE_RULE_STRPUB("aes-256-cbc"),                                                                                     // val/str
+    PARSE_RULE_STRPUB("aes-256-gcm"),                                                                                     // val/str
     PARSE_RULE_STRPUB("asc"),                                                                                             // val/str
     PARSE_RULE_STRPUB("auto"),                                                                                            // val/str
     PARSE_RULE_STRPUB("azure"),                                                                                           // val/str
@@ -205,6 +207,7 @@ typedef enum
     parseRuleValStrQT_6_QT,                                                                                          // val/str/enum
     parseRuleValStrQT_64KiB_QT,                                                                                      // val/str/enum
     parseRuleValStrQT_65535_QT,                                                                                      // val/str/enum
+    parseRuleValStrQT_7_QT,                                                                                          // val/str/enum
     parseRuleValStrQT_7d_QT,                                                                                         // val/str/enum
     parseRuleValStrQT_8432_QT,                                                                                       // val/str/enum
     parseRuleValStrQT_8KiB_QT,                                                                                       // val/str/enum
@@ -215,6 +218,7 @@ typedef enum
     parseRuleValStrQT_9999999_QT,                                                                                    // val/str/enum
     parseRuleValStrQT_accept_DS_new_QT,                                                                              // val/str/enum
     parseRuleValStrQT_aes_DS_256_DS_cbc_QT,                                                                          // val/str/enum
+    parseRuleValStrQT_aes_DS_256_DS_gcm_QT,                                                                          // val/str/enum
     parseRuleValStrQT_asc_QT,                                                                                        // val/str/enum
     parseRuleValStrQT_auto_QT,                                                                                       // val/str/enum
     parseRuleValStrQT_azure_QT,                                                                                      // val/str/enum
@@ -305,6 +309,7 @@ static const int parseRuleValueInt[] =
     3,                                                                                                                    // val/int
     5,                                                                                                                    // val/int
     6,                                                                                                                    // val/int
+    7,                                                                                                                    // val/int
     9,                                                                                                                    // val/int
     12,                                                                                                                   // val/int
     19,                                                                                                                   // val/int
@@ -335,6 +340,7 @@ static const uint8_t parseRuleValueIntStrMap[] =
     parseRuleValStrQT_3_QT,                                                                                        // val/int/strmap
     parseRuleValStrQT_5_QT,                                                                                        // val/int/strmap
     parseRuleValStrQT_6_QT,                                                                                        // val/int/strmap
+    parseRuleValStrQT_7_QT,                                                                                        // val/int/strmap
     parseRuleValStrQT_9_QT,                                                                                        // val/int/strmap
     parseRuleValStrQT_12_QT,                                                                                       // val/int/strmap
     parseRuleValStrQT_19_QT,                                                                                       // val/int/strmap
@@ -365,6 +371,7 @@ typedef enum
     parseRuleValInt3,                                                                                                // val/int/enum
     parseRuleValInt5,                                                                                                // val/int/enum
     parseRuleValInt6,                                                                                                // val/int/enum
+    parseRuleValInt7,                                                                                                // val/int/enum
     parseRuleValInt9,                                                                                                // val/int/enum
     parseRuleValInt12,                                                                                               // val/int/enum
     parseRuleValInt19,                                                                                               // val/int/enum
@@ -5978,6 +5985,7 @@ static const ParseRuleOption parseRuleOption[CFG_OPTION_TOTAL] =
                 (                                                                                            // opt/repo-cipher-pass
                     PARSE_RULE_VAL_OPT(RepoCipherType),                                                      // opt/repo-cipher-pass
                     PARSE_RULE_VAL_STRID(aes_DS_256_DS_cbc),                                                 // opt/repo-cipher-pass
+                    PARSE_RULE_VAL_STRID(aes_DS_256_DS_gcm),                                                 // opt/repo-cipher-pass
                 ),                                                                                           // opt/repo-cipher-pass
             ),                                                                                               // opt/repo-cipher-pass
         ),                                                                                                   // opt/repo-cipher-pass
@@ -6056,6 +6064,7 @@ static const ParseRuleOption parseRuleOption[CFG_OPTION_TOTAL] =
                 (                                                                                            // opt/repo-cipher-type
                     PARSE_RULE_VAL_STRID(none),                                                              // opt/repo-cipher-type
                     PARSE_RULE_VAL_STRID(aes_DS_256_DS_cbc),                                                 // opt/repo-cipher-type
+                    PARSE_RULE_VAL_STRID(aes_DS_256_DS_gcm),                                                 // opt/repo-cipher-type
                 ),                                                                                           // opt/repo-cipher-type
                                                                                                              // opt/repo-cipher-type
                 PARSE_RULE_OPTIONAL_DEFAULT                                                                  // opt/repo-cipher-type
@@ -6088,6 +6097,7 @@ static const ParseRuleOption parseRuleOption[CFG_OPTION_TOTAL] =
                 (                                                                                                 // opt/repo-format
                     PARSE_RULE_VAL_INT(5),                                                                        // opt/repo-format
                     PARSE_RULE_VAL_INT(6),                                                                        // opt/repo-format
+                    PARSE_RULE_VAL_INT(7),                                                                        // opt/repo-format
                 ),                                                                                                // opt/repo-format
                                                                                                                   // opt/repo-format
                 PARSE_RULE_OPTIONAL_DEFAULT                                                                       // opt/repo-format

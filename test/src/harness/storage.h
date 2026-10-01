@@ -203,6 +203,7 @@ typedef struct HrnStoragePutParam
     time_t timeModified;                                            // Time file was last modified
     CompressType compressType;                                      // Limited to gz and bz2 (lz4 and zstd are not always available)
     const CipherSpec *cipherSpec;                                   // Cipher spec to encrypt the file with
+    const StringList *cipherIdentity;                               // Identity the file is bound to (aes-256-gcm only)
     const char *comment;                                            // Comment
 } HrnStoragePutParam;
 

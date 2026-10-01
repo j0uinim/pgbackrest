@@ -513,8 +513,23 @@ manifestFree(Manifest *const this)
 /***********************************************************************************************************************************
 Helper functions
 ***********************************************************************************************************************************/
-// Load backup manifest
-FN_EXTERN Manifest *manifestLoadFile(const Storage *storage, const String *fileName, const CipherSpec *cipherSpec);
+// The identity an aes-256-gcm manifest is bound to, from the name it is stored under: {"manifest", <label>, "final"} for
+// <label>/backup.manifest and {"manifest", <label>, "in-progress"} for the copy saved while the backup runs
+FN_EXTERN StringList *manifestCipherIdentity(const String *fileName);
+
+// Load backup manifest. The file name is backup.manifest and its copy is tried when it cannot be loaded, except with aes-256-gcm
+// where the copy is the in-progress manifest: it is never used in place of the final manifest and it is loaded only when asked for.
+typedef struct ManifestLoadFileParam
+{
+    VAR_PARAM_HEADER;
+    bool inProgress;                                                // Load the in-progress manifest of a backup not yet complete
+} ManifestLoadFileParam;
+
+#define manifestLoadFileP(storage, fileName, cipherSpec, ...)                                                                      \
+    manifestLoadFile(storage, fileName, cipherSpec, (ManifestLoadFileParam){VAR_PARAM_INIT, __VA_ARGS__})
+
+FN_EXTERN Manifest *manifestLoadFile(
+    const Storage *storage, const String *fileName, const CipherSpec *cipherSpec, ManifestLoadFileParam param);
 
 /***********************************************************************************************************************************
 Macros for function logging

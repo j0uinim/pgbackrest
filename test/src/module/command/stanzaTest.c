@@ -1,7 +1,9 @@
 /***********************************************************************************************************************************
 Test Stanza Commands
 ***********************************************************************************************************************************/
+
 #include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferWrite.h"
 #include "postgres/interface.h"
 #include "postgres/version.h"
@@ -315,6 +317,48 @@ testRun(void)
         TEST_RESULT_VOID(cmdStanzaDelete(), "stanza delete - repo3 - sub directories only");
 
         TEST_STORAGE_LIST(storageTest, "repo3", "archive/\nbackup/\n", .comment = "stanza deleted");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("cmdStanzaCreate success - aes-256-gcm, which creates the stanza at format 7");
+
+        argList = strLstNew();
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        hrnCfgArgRawZ(argList, cfgOptStanza, TEST_STANZA);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+        TEST_RESULT_LOG("P00   INFO: stanza-create for stanza 'db' on repo1");
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF(TEST_STANZA));
+
+        TEST_RESULT_STR_Z(
+            strNewBuf(BUF(bufPtrConst(storageGetP(storageNewReadP(storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR))), 8)), "PGBR007G",
+            "archive info prefix");
+
+        TEST_ASSIGN(
+            infoArchive, infoArchiveLoadFile(storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR, cipherSpecGcm), "load archive info");
+        TEST_RESULT_UINT(infoArchiveFormat(infoArchive), REPOSITORY_FORMAT_7, "format 7");
+        TEST_RESULT_UINT(cipherSpecType(infoArchiveCipherSpec(infoArchive)), cipherTypeAes256Gcm, "cipher sub set");
+        TEST_RESULT_UINT(
+            bufUsed(cipherGcmKeyDecode(cipherSpecPass(infoArchiveCipherSpec(infoArchive)))), 32, "cipher sub is a key");
+
+        TEST_ASSIGN(
+            infoBackup, infoBackupLoadFile(storageRepoIdx(0), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup info");
+        TEST_RESULT_UINT(infoBackupFormat(infoBackup), REPOSITORY_FORMAT_7, "format 7");
+        TEST_RESULT_UINT(
+            bufUsed(cipherGcmKeyDecode(cipherSpecPass(infoBackupCipherSpec(infoBackup)))), 32, "cipher sub is a key");
+        TEST_RESULT_BOOL(
+            bufEq(cipherSpecPass(infoArchiveCipherSpec(infoArchive)), cipherSpecPass(infoBackupCipherSpec(infoBackup))), false,
+            "cipher sub different for archive and backup");
+
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("cmdStanzaCreate errors");
@@ -1255,18 +1299,70 @@ testRun(void)
 
         hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
 
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("stanza-upgrade - aes-256-cbc is not upgraded to aes-256-gcm");
+
+        // Every file of the repository is encrypted with aes-256-cbc, so changing the cipher type would leave them unreadable
+        argList = strLstNew();
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        hrnCfgArgRawZ(argList, cfgOptStanza, TEST_STANZA);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 1, TEST_PATH "/repo-migrate");
+        hrnCfgArgRawZ(argList, cfgOptPgVersionForce, "15");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 1, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdStanzaUpgrade, argList);
+
+        TEST_ERROR(
+            cmdStanzaUpgrade(), FormatError,
+            "unable to load info file '" TEST_PATH "/repo-migrate/archive/db/archive.info'"
+            " or '" TEST_PATH "/repo-migrate/archive/db/archive.info.copy':\n"
+            "FormatError: cipher header is not repository format 7 with cipher type aes-256-gcm\n"
+            "FormatError: cipher header is not repository format 7 with cipher type aes-256-gcm\n"
+            "HINT: archive.info cannot be opened but is required to push/get WAL segments.\n"
+            "HINT: is archive_command configured correctly in postgresql.conf?\n"
+            "HINT: has a stanza-create been performed?\n"
+            "HINT: use --no-archive-check to disable archive checks during backup if you have an alternate archiving scheme.");
+        TEST_RESULT_LOG("P00   INFO: stanza-upgrade for stanza 'db' on repo1");
+
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
+
+        // Nothing was written, so the repository is still at format 6 with aes-256-cbc
+        TEST_ASSIGN(
+            infoArchiveMigrate, infoArchiveLoadFile(storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR, cipherSpecMain),
+            "load archive info after the refused upgrade");
+        TEST_RESULT_UINT(infoArchiveFormat(infoArchiveMigrate), REPOSITORY_FORMAT_6, "archive info at format 6");
+        TEST_RESULT_UINT(
+            infoBackupFormat(infoBackupLoadFile(storageRepoIdx(0), INFO_BACKUP_PATH_FILE_STR, cipherSpecMain)),
+            REPOSITORY_FORMAT_6, "backup info at format 6");
+#endif
+
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("stanza-upgrade - every format that can be read can be requested");
 
         // The allow list for repo-format in build/config.yaml and REPOSITORY_FORMAT_MIN/MAX in version.h are declared separately,
-        // so make sure they match
+        // so make sure they match. Format 7 is written with aes-256-gcm, which needs OpenSSL 3.0.8 or later.
+#ifdef CIPHER_GCM_SUPPORTED
         for (unsigned int format = REPOSITORY_FORMAT_MIN; format <= REPOSITORY_FORMAT_MAX; format++)
+#else
+        for (unsigned int format = REPOSITORY_FORMAT_MIN; format < REPOSITORY_FORMAT_7; format++)
+#endif
         {
             argList = strLstDup(argListBase);
             hrnCfgArgKeyRawFmt(argList, cfgOptRepoFormat, 1, "%u", format);
+
+            // Format 7 is written with aes-256-gcm only
+            if (format == REPOSITORY_FORMAT_7)
+            {
+                hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 1, cipherTypeAes256Gcm);
+                hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+            }
+
             HRN_CFG_LOAD(cfgCmdStanzaUpgrade, argList);
 
             TEST_RESULT_UINT(cfgOptionIdxUInt(cfgOptRepoFormat, 0), format, "format allowed");
+            hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
         }
 
         const unsigned int formatUnsupported = REPOSITORY_FORMAT_MAX + 1;
@@ -1277,7 +1373,79 @@ testRun(void)
         TEST_ERROR_FMT(
             hrnCfgLoadP(cfgCmdStanzaUpgrade, argList), OptionInvalidValueError,
             "'%u' is not allowed for 'repo1-format' option\n"
-            "HINT: allowed values are '5', '6'", formatUnsupported);
+            "HINT: allowed values are '5', '6', '7'", formatUnsupported);
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("stanza-upgrade - an aes-256-gcm stanza to a new PostgreSQL version");
+
+        argList = strLstNew();
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        hrnCfgArgRawZ(argList, cfgOptStanza, TEST_STANZA);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg-gcm");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc-upgrade");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+
+        TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+        TEST_RESULT_LOG("P00   INFO: stanza-create for stanza 'db' on repo1");
+
+        const CipherSpec *const cipherSpecGcmUpgrade = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF(TEST_STANZA));
+        const InfoArchive *infoArchiveGcm = infoArchiveLoadFile(
+            storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR, cipherSpecGcmUpgrade);
+        const InfoBackup *infoBackupGcm = infoBackupLoadFile(storageRepoIdx(0), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcmUpgrade);
+        const Buffer *const subPassArchive = bufDup(cipherSpecPass(infoArchiveCipherSpec(infoArchiveGcm)));
+        const Buffer *const subPassBackup = bufDup(cipherSpecPass(infoBackupCipherSpec(infoBackupGcm)));
+
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_16);
+
+        HRN_CFG_LOAD(cfgCmdStanzaUpgrade, argList);
+
+        TEST_RESULT_VOID(cmdStanzaUpgrade(), "stanza upgrade");
+        TEST_RESULT_LOG("P00   INFO: stanza-upgrade for stanza 'db' on repo1");
+
+        TEST_RESULT_STR_Z(
+            strNewBuf(BUF(bufPtrConst(storageGetP(storageNewReadP(storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR))), 8)), "PGBR007G",
+            "archive info prefix");
+        TEST_RESULT_STR_Z(
+            strNewBuf(BUF(bufPtrConst(storageGetP(storageNewReadP(storageRepoIdx(0), INFO_BACKUP_PATH_FILE_STR))), 8)), "PGBR007G",
+            "backup info prefix");
+
+        TEST_ASSIGN(
+            infoArchiveGcm, infoArchiveLoadFile(storageRepoIdx(0), INFO_ARCHIVE_PATH_FILE_STR, cipherSpecGcmUpgrade),
+            "load archive info");
+        TEST_RESULT_UINT(infoArchiveFormat(infoArchiveGcm), REPOSITORY_FORMAT_7, "archive info at format 7");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoArchivePg(infoArchiveGcm)).version, PG_VERSION_16, "archive info at PG 16");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoArchivePg(infoArchiveGcm)).id, 2, "archive info history id 2");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoArchivePg(infoArchiveGcm)).systemId, HRN_PG_SYSTEMID_16, "archive info system id");
+        TEST_RESULT_BOOL(
+            bufEq(cipherSpecPass(infoArchiveCipherSpec(infoArchiveGcm)), subPassArchive), true, "archive sub key unchanged");
+
+        TEST_ASSIGN(
+            infoBackupGcm, infoBackupLoadFile(storageRepoIdx(0), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcmUpgrade),
+            "load backup info");
+        TEST_RESULT_UINT(infoBackupFormat(infoBackupGcm), REPOSITORY_FORMAT_7, "backup info at format 7");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoBackupPg(infoBackupGcm)).version, PG_VERSION_16, "backup info at PG 16");
+        TEST_RESULT_UINT(infoPgDataCurrent(infoBackupPg(infoBackupGcm)).id, 2, "backup info history id 2");
+        TEST_RESULT_BOOL(
+            bufEq(cipherSpecPass(infoBackupCipherSpec(infoBackupGcm)), subPassBackup), true, "backup sub key unchanged");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("stanza-upgrade - an aes-256-gcm stanza is not migrated to format 6");
+
+        hrnCfgArgRawZ(argList, cfgOptRepoFormat, "6");
+
+        TEST_ERROR(
+            hrnCfgLoadP(cfgCmdStanzaUpgrade, argList), OptionInvalidValueError,
+            "'6' is not valid for 'repo1-format' option with 'repo1-cipher-type' option 'aes-256-gcm'\n"
+            "HINT: repository format 7 is written with cipher type aes-256-gcm only.");
+
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
     }
 
     // *****************************************************************************************************************************

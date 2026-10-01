@@ -691,6 +691,7 @@ backupJobCallback(void *const data, const unsigned int clientIdx)
                     pckWriteU32P(param, jobData->compressType);
                     pckWriteI32P(param, jobData->compressLevel);
                     cipherSpecPack(param, jobData->cipherSpecBackup);
+                    pckWriteStrP(param, jobData->backupLabel);
                     pckWriteU32P(param, jobData->pageSize);
                     pckWriteStrP(param, cfgOptionStrNull(cfgOptPgVersionForce));
                 }
@@ -705,7 +706,8 @@ backupJobCallback(void *const data, const unsigned int clientIdx)
                 pckWriteBoolP(param, file.checksumPage);
                 pckWriteBoolP(param, cfgOptionBool(cfgOptPageHeaderCheck));
 
-                // If block incremental then provide the location of the prior map when available
+                // If block incremental then provide the location of the prior map and the label of the backup that wrote it when
+                // available
                 if (blockIncr)
                 {
                     pckWriteU64P(param, file.blockIncrSize);
@@ -720,6 +722,7 @@ backupJobCallback(void *const data, const unsigned int clientIdx)
                                 file.reference, .manifestName = file.name, .bundleId = file.bundleId, .blockIncr = true));
                         pckWriteU64P(param, file.bundleOffset + file.sizeRepo - file.blockIncrMapSize);
                         pckWriteU64P(param, file.blockIncrMapSize);
+                        pckWriteStrP(param, file.reference);
                     }
                     else
                         pckWriteNullP(param);

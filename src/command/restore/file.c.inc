@@ -31,7 +31,7 @@ static List *
 restoreFile(
     const String *const repoFile, const unsigned int repoIdx, const CompressType repoFileCompressType, const time_t copyTimeBegin,
     const bool delta, const bool deltaForce, const bool bundleRaw, const CipherSpec *const cipherSpecBackup,
-    const StringList *const referenceList, List *const fileList)
+    const String *const backupLabel, const StringList *const referenceList, List *const fileList)
 {
     FUNCTION_LOG_BEGIN(logLevelDebug);
         FUNCTION_LOG_PARAM(STRING, repoFile);
@@ -42,11 +42,13 @@ restoreFile(
         FUNCTION_LOG_PARAM(BOOL, deltaForce);
         FUNCTION_LOG_PARAM(BOOL, bundleRaw);
         FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpecBackup);
+        FUNCTION_LOG_PARAM(STRING, backupLabel);                    // Label of the backup that wrote the repo file
         FUNCTION_LOG_PARAM(STRING_LIST, referenceList);             // List of references (for block incremental)
         FUNCTION_LOG_PARAM(LIST, fileList);                         // List of files to restore
     FUNCTION_LOG_END();
 
     ASSERT(repoFile != NULL);
+    ASSERT(backupLabel != NULL);
 
     // Restore file results
     List *const result = lstNewP(sizeof(RestoreFileResult));
@@ -264,8 +266,10 @@ restoreFile(
                         if (cipherSpecType(cipherSpecBackup) != cipherTypeNone)
                         {
                             ioFilterGroupAdd(
-                                ioReadFilterGroup(blockMapRead), cipherBlockNewP(
-                                    cipherModeDecrypt, cipherSpecBackup, .header = cipherBlockHeaderNone));
+                                ioReadFilterGroup(blockMapRead),
+                                cipherFormatNewP(
+                                    cipherModeDecrypt, cipherSpecBackup,
+                                    backupBlockMapCipherIdentity(backupLabel, file->manifestFile), .raw = true));
                         }
 
                         ioReadOpen(blockMapRead);
@@ -273,6 +277,9 @@ restoreFile(
                         const BlockMap *const blockMap = blockMapNewRead(
                             blockMapRead, file->blockIncrSize, file->blockIncrChecksumSize);
 
+                        // The map ends with its last item, but read to the end of the stream anyway so that a cipher has verified
+                        // all of it rather than relying on where the map ends
+                        ioReadFlushP(blockMapRead, .errorOnBytes = true);
                         ioReadFree(blockMapRead);
 
                         // Open file to write
@@ -281,7 +288,7 @@ restoreFile(
                         // Apply delta to file
                         BlockDelta *const blockDelta = blockDeltaNew(
                             blockMap, file->blockIncrSize, file->blockIncrChecksumSize, file->blockChecksum, cipherSpecBackup,
-                            repoFileCompressType);
+                            referenceList, file->manifestFile, repoFileCompressType);
 
                         for (unsigned int readIdx = 0; readIdx < blockDeltaReadSize(blockDelta); readIdx++)
                         {
@@ -339,9 +346,9 @@ restoreFile(
                         {
                             ioFilterGroupAdd(
                                 filterGroup,
-                                cipherBlockNewP(
-                                    cipherModeDecrypt, cipherSpecBackup,
-                                    .header = bundleRaw ? cipherBlockHeaderNone : cipherBlockHeaderMagic));
+                                cipherFormatNewP(
+                                    cipherModeDecrypt, cipherSpecBackup, backupFileCipherIdentity(backupLabel, file->manifestFile),
+                                    .raw = bundleRaw));
                         }
 
                         // Add decompression filter

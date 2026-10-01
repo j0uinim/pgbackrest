@@ -2,6 +2,7 @@
 Test Backup Info Handler
 ***********************************************************************************************************************************/
 #include "command/backup/common.h"
+#include "common/format/cipherBlockFormat.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "storage/posix/storage.h"

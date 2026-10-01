@@ -1,6 +1,7 @@
 /***********************************************************************************************************************************
 Test Protocol
 ***********************************************************************************************************************************/
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/fdRead.h"
@@ -1413,6 +1414,55 @@ testRun(void)
         TEST_RESULT_STR_Z(cfgOptionIdxStr(cfgOptRepoCipherPass, 1), "xxxx", "check repo2 cipher pass after");
 
         TEST_RESULT_VOID(protocolFree(), "free remote protocol objects");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm settings from the remote are checked as they are at load");
+
+        // Each repository host has a valid configuration of its own, but both have the same key
+        storagePut(
+            storageNewWriteP(storageTest, STRDEF("pgbackrest-gcm1.conf")),
+            BUFSTRDEF(
+                "[global]\n"
+                "repo1-cipher-type=aes-256-gcm\n"
+                "repo1-cipher-pass=" TEST_CIPHER_KEY "\n"));
+        storagePut(
+            storageNewWriteP(storageTest, STRDEF("pgbackrest-gcm2.conf")),
+            BUFSTRDEF(
+                "[global]\n"
+                "repo2-cipher-type=aes-256-gcm\n"
+                "repo2-cipher-pass=" TEST_CIPHER_KEY "\n"));
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "db");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, "/pg");
+        hrnCfgArgRawZ(argList, cfgOptProtocolTimeout, "10");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHostConfig, 1, TEST_PATH "/pgbackrest-gcm1.conf");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHost, 1, "localhost");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHostUser, 1, TEST_USER);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 1, TEST_PATH);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHostConfig, 2, TEST_PATH "/pgbackrest-gcm2.conf");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHost, 2, "localhost");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoHostUser, 2, TEST_USER);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 2, TEST_PATH "2");
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        TEST_RESULT_UINT(cfgOptionIdxUInt(cfgOptRepoFormat, 0), 5, "repo1 format before");
+        TEST_RESULT_VOID(protocolRemoteGet(protocolStorageTypeRepo, 0, true), "get repo1 remote protocol");
+        TEST_RESULT_UINT(cfgOptionIdxUInt(cfgOptRepoFormat, 0), 7, "repo1 format follows the cipher");
+
+        TEST_ERROR(
+            protocolRemoteGet(protocolStorageTypeRepo, 1, true), OptionInvalidValueError,
+            "'repo1-cipher-pass' and 'repo2-cipher-pass' options must not be the same key");
+
+        // The remote was freed and the options were not set, so asking again checks again
+        TEST_ERROR(
+            protocolRemoteGet(protocolStorageTypeRepo, 1, true), OptionInvalidValueError,
+            "'repo1-cipher-pass' and 'repo2-cipher-pass' options must not be the same key");
+        TEST_RESULT_UINT(cfgOptionIdxStrId(cfgOptRepoCipherType, 1), cipherTypeNone, "repo2 cipher is not set");
+
+        TEST_RESULT_VOID(protocolFree(), "free remote protocol objects");
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("start remote protocol");

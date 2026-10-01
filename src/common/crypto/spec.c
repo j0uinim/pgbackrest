@@ -23,6 +23,7 @@ cipherSpecNew(const CipherType type, const Buffer *const pass, const CipherSpecN
         FUNCTION_TEST_PARAM(STRING_ID, type);
         FUNCTION_TEST_PARAM(BUFFER, pass);
         FUNCTION_TEST_PARAM(STRING_ID, param.digest);
+        FUNCTION_TEST_PARAM(STRING, param.stanza);
     FUNCTION_TEST_END();
 
     ASSERT((type == cipherTypeNone) == (pass == NULL));
@@ -36,6 +37,7 @@ cipherSpecNew(const CipherType type, const Buffer *const pass, const CipherSpecN
         {
             this->pub.digest = param.digest;
             this->pub.pass = bufDup(pass);
+            this->pub.stanza = strDup(param.stanza);
         }
     }
     OBJ_NEW_END();
@@ -63,6 +65,7 @@ cipherSpecNewPack(PackRead *const packRead)
         {
             this->pub.digest = (HashType)pckReadStrIdP(packRead);
             this->pub.pass = pckReadBinP(packRead);
+            this->pub.stanza = pckReadStrP(packRead);
         }
     }
     OBJ_NEW_END();
@@ -85,7 +88,8 @@ cipherSpecDup(const CipherSpec *const this, const CipherSpecDupParam param)
         CIPHER_SPEC,
         cipherSpecNewP(
             cipherSpecType(this), cipherSpecPass(this),
-            .digest = cipherSpecDigest(this) == 0 ? param.digestDefault : cipherSpecDigest(this)));
+            .digest = cipherSpecDigest(this) == 0 ? param.digestDefault : cipherSpecDigest(this),
+            .stanza = cipherSpecStanza(this)));
 }
 
 /**********************************************************************************************************************************/
@@ -107,6 +111,7 @@ cipherSpecPack(PackWrite *const packWrite, const CipherSpec *const this)
     {
         pckWriteStrIdP(packWrite, cipherSpecDigest(this));
         pckWriteBinP(packWrite, cipherSpecPass(this));
+        pckWriteStrP(packWrite, cipherSpecStanza(this));
     }
 
     FUNCTION_TEST_RETURN_VOID();
@@ -129,6 +134,10 @@ cipherSpecToLog(const CipherSpec *const this, StringStatic *const debugLog)
 
         strStcFmt(debugLog, ", digest: %s", digestZ);
     }
+
+    // The stanza is logged whenever there is a cipher since the streams of aes-256-gcm are bound to it
+    if (cipherSpecType(this) != cipherTypeNone)
+        strStcFmt(debugLog, ", stanza: %s", cipherSpecStanza(this) == NULL ? NULL_Z : strZ(cipherSpecStanza(this)));
 
     strStcCatChr(debugLog, '}');
 }

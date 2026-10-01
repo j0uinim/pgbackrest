@@ -3,7 +3,9 @@ Test Info Command
 
 NOTE: references to 9.4 are intentionally included in this test to ensure that info will work with no longer supported versions.
 ***********************************************************************************************************************************/
+
 #include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "storage/posix/storage.h"
@@ -11,6 +13,10 @@ NOTE: references to 9.4 are intentionally included in this test to ensure that i
 #include "harness/config.h"
 #include "harness/fork.h"
 #include "harness/info.h"
+
+/***********************************************************************************************************************************
+Keys for the aes-256-gcm repository
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test Run
@@ -4071,6 +4077,353 @@ testRun(void)
             "stanza: stanza1\n"
             "    status: error (different across repos)\n",
             "text (progress only) - stanza repo structure exists");
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("cmdInfo() with aes-256-gcm"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        StringList *argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "db");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdInfo, argList);
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("db"));
+        const CipherSpec *const cipherSpecGcmManifest = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_MANIFEST), .stanza = STRDEF("db"));
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_ARCHIVE_PATH_FILE,
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_ARCHIVE "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":6846378200844646865,\"db-version\":\"12\"}\n",
+            .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_BACKUP_PATH_FILE,
+            "[backup:current]\n"
+            "20200101-000000F={"
+            "\"backrest-format\":5,\"backrest-version\":\"2.58.0dev\","
+            "\"backup-archive-start\":\"000000010000000000000001\",\"backup-archive-stop\":\"000000010000000000000001\","
+            "\"backup-info-repo-size\":2369186,\"backup-info-repo-size-delta\":2369186,"
+            "\"backup-info-size\":20162900,\"backup-info-size-delta\":20162900,"
+            "\"backup-timestamp-start\":1577836800,\"backup-timestamp-stop\":1577836802,\"backup-type\":\"full\","
+            "\"db-id\":1,\"option-archive-check\":true,\"option-archive-copy\":false,\"option-backup-standby\":false,"
+            "\"option-checksum-page\":true,\"option-compress\":false,\"option-hardlink\":false,\"option-online\":true}\n"
+            "20200102-000000F={"
+            "\"backrest-format\":5,\"backrest-version\":\"2.58.0dev\","
+            "\"backup-archive-start\":\"000000010000000000000002\",\"backup-archive-stop\":\"000000010000000000000002\","
+            "\"backup-info-repo-size\":2369186,\"backup-info-repo-size-delta\":2369186,"
+            "\"backup-info-size\":20162900,\"backup-info-size-delta\":20162900,"
+            "\"backup-timestamp-start\":1577923200,\"backup-timestamp-stop\":1577923202,\"backup-type\":\"full\","
+            "\"db-id\":1,\"option-archive-check\":true,\"option-archive-copy\":false,\"option-backup-standby\":false,"
+            "\"option-checksum-page\":true,\"option-compress\":false,\"option-hardlink\":false,\"option-online\":true}\n"
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_MANIFEST "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-catalog-version\":201909212,\"db-control-version\":1201,\"db-system-id\":6846378200844646865"
+            ",\"db-version\":\"12\"}\n",
+            .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20200101-000000F/" BACKUP_MANIFEST_FILE,
+            "[backup]\n"
+            "backup-archive-start=\"000000010000000000000001\"\n"
+            "backup-archive-stop=\"000000010000000000000001\"\n"
+            "backup-label=\"20200101-000000F\"\n"
+            "backup-lsn-start=\"0/1000028\"\n"
+            "backup-lsn-stop=\"0/1000100\"\n"
+            "backup-timestamp-copy-start=1577836801\n"
+            "backup-timestamp-start=1577836800\n"
+            "backup-timestamp-stop=1577836802\n"
+            "backup-type=\"full\"\n"
+            "\n"
+            "[backup:db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[backup:option]\n"
+            "option-archive-check=true\n"
+            "option-archive-copy=false\n"
+            "option-compress=false\n"
+            "option-hardlink=false\n"
+            "option-online=true\n"
+            "\n"
+            "[backup:target]\n"
+            "pg_data={\"path\":\"/pg/base\",\"type\":\"path\"}\n"
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_BACKUP "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "postgres={\"db-id\":13424,\"db-last-system-id\":13423}\n"
+            "\n"
+            "[target:file]\n"
+            "pg_data/PG_VERSION={\"checksum\":\"184473f470864e067ee3a22e64b47b0a1c356f29\",\"size\":4,\"timestamp\":1577836800}\n"
+            "\n"
+            "[target:file:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0600\"\n"
+            "user=\"user1\"\n"
+            "\n"
+            "[target:path]\n"
+            "pg_data={}\n"
+            "\n"
+            "[target:path:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0700\"\n"
+            "user=\"user1\"\n",
+            .cipherSpec = cipherSpecGcmManifest);
+
+        // The manifest of the second backup is a copy of the manifest of the first
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20200102-000000F/" BACKUP_MANIFEST_FILE,
+            storageGetP(storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20200101-000000F/" BACKUP_MANIFEST_FILE))),
+            .comment = "copy manifest of 20200101-000000F to 20200102-000000F");
+
+        // Info only lists WAL, so the segments do not need to be encrypted
+        HRN_STORAGE_PUT_EMPTY(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/12-1/0000000100000000/000000010000000000000001-"
+            "11dff2b7552a9d66e4bae1a762488a6885e7082c");
+        HRN_STORAGE_PUT_EMPTY(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/12-1/0000000100000000/000000010000000000000002-"
+            "2261b8f1ec7b1e6c3eaee9345214595eb7daa9a1");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("stanza and backups");
+
+        TEST_RESULT_STR_Z(
+            infoRender(),
+            "stanza: db\n"
+            "    status: ok\n"
+            "    cipher: aes-256-gcm\n"
+            "\n"
+            "    db (current)\n"
+            "        wal archive min/max (12): 000000010000000000000001/000000010000000000000002\n"
+            "\n"
+            "        full backup: 20200101-000000F\n"
+            "            timestamp start/stop: 2020-01-01 00:00:00+00 / 2020-01-01 00:00:02+00\n"
+            "            wal start/stop: 000000010000000000000001 / 000000010000000000000001\n"
+            "            database size: 19.2MB, database backup size: 19.2MB\n"
+            "            repo1: backup set size: 2.3MB, backup size: 2.3MB\n"
+            "\n"
+            "        full backup: 20200102-000000F\n"
+            "            timestamp start/stop: 2020-01-02 00:00:00+00 / 2020-01-02 00:00:02+00\n"
+            "            wal start/stop: 000000010000000000000002 / 000000010000000000000002\n"
+            "            database size: 19.2MB, database backup size: 19.2MB\n"
+            "            repo1: backup set size: 2.3MB, backup size: 2.3MB\n",
+            "text");
+
+        // Without the stanza option info reads every stanza, each under its own stanza
+        StringList *argListAll = strLstNew();
+        hrnCfgArgRawZ(argListAll, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawStrId(argListAll, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        HRN_CFG_LOAD(cfgCmdInfo, argListAll);
+
+        TEST_RESULT_STR_Z(
+            infoRender(),
+            "stanza: db\n"
+            "    status: ok\n"
+            "    cipher: aes-256-gcm\n"
+            "\n"
+            "    db (current)\n"
+            "        wal archive min/max (12): 000000010000000000000001/000000010000000000000002\n"
+            "\n"
+            "        full backup: 20200101-000000F\n"
+            "            timestamp start/stop: 2020-01-01 00:00:00+00 / 2020-01-01 00:00:02+00\n"
+            "            wal start/stop: 000000010000000000000001 / 000000010000000000000001\n"
+            "            database size: 19.2MB, database backup size: 19.2MB\n"
+            "            repo1: backup set size: 2.3MB, backup size: 2.3MB\n"
+            "\n"
+            "        full backup: 20200102-000000F\n"
+            "            timestamp start/stop: 2020-01-02 00:00:00+00 / 2020-01-02 00:00:02+00\n"
+            "            wal start/stop: 000000010000000000000002 / 000000010000000000000002\n"
+            "            database size: 19.2MB, database backup size: 19.2MB\n"
+            "            repo1: backup set size: 2.3MB, backup size: 2.3MB\n",
+            "text without the stanza option");
+
+        StringList *argListJson = strLstDup(argList);
+        hrnCfgArgRawZ(argListJson, cfgOptOutput, "json");
+        HRN_CFG_LOAD(cfgCmdInfo, argListJson);
+
+        TEST_RESULT_STR_Z(
+            infoRender(),
+            // {uncrustify_off - indentation}
+            "["
+                "{"
+                    "\"archive\":["
+                        "{"
+                            "\"database\":{"
+                                "\"id\":1,"
+                                "\"repo-key\":1"
+                            "},"
+                            "\"id\":\"12-1\","
+                            "\"max\":\"000000010000000000000002\","
+                            "\"min\":\"000000010000000000000001\""
+                        "}"
+                    "],"
+                    "\"backup\":["
+                        "{"
+                            "\"archive\":{"
+                                "\"start\":\"000000010000000000000001\","
+                                "\"stop\":\"000000010000000000000001\""
+                            "},"
+                            "\"backrest\":{"
+                                "\"format\":5,"
+                                "\"version\":\"2.58.0dev\""
+                            "},"
+                            "\"database\":{"
+                                "\"id\":1,"
+                                "\"repo-key\":1"
+                            "},"
+                            "\"info\":{"
+                                "\"delta\":20162900,"
+                                "\"repository\":{"
+                                    "\"delta\":2369186,"
+                                    "\"size\":2369186"
+                                "},"
+                                "\"size\":20162900"
+                            "},"
+                            "\"label\":\"20200101-000000F\","
+                            "\"prior\":null,"
+                            "\"reference\":null,"
+                            "\"timestamp\":{"
+                                "\"start\":1577836800,"
+                                "\"stop\":1577836802"
+                            "},"
+                            "\"type\":\"full\""
+                        "},"
+                        "{"
+                            "\"archive\":{"
+                                "\"start\":\"000000010000000000000002\","
+                                "\"stop\":\"000000010000000000000002\""
+                            "},"
+                            "\"backrest\":{"
+                                "\"format\":5,"
+                                "\"version\":\"2.58.0dev\""
+                            "},"
+                            "\"database\":{"
+                                "\"id\":1,"
+                                "\"repo-key\":1"
+                            "},"
+                            "\"info\":{"
+                                "\"delta\":20162900,"
+                                "\"repository\":{"
+                                    "\"delta\":2369186,"
+                                    "\"size\":2369186"
+                                "},"
+                                "\"size\":20162900"
+                            "},"
+                            "\"label\":\"20200102-000000F\","
+                            "\"prior\":null,"
+                            "\"reference\":null,"
+                            "\"timestamp\":{"
+                                "\"start\":1577923200,"
+                                "\"stop\":1577923202"
+                            "},"
+                            "\"type\":\"full\""
+                        "}"
+                    "],"
+                    "\"cipher\":\"aes-256-gcm\","
+                    "\"db\":["
+                        "{"
+                            "\"id\":1,"
+                            "\"repo-key\":1,"
+                            "\"system-id\":6846378200844646865,"
+                            "\"version\":\"12\""
+                        "}"
+                    "],"
+                    "\"name\":\"db\","
+                    "\"repo\":["
+                        "{"
+                            "\"cipher\":\"aes-256-gcm\","
+                            "\"key\":1,"
+                            "\"status\":{"
+                                "\"code\":0,"
+                                "\"message\":\"ok\""
+                            "}"
+                        "}"
+                    "],"
+                    "\"status\":{"
+                        "\"code\":0,"
+                        "\"lock\":{"
+                            "\"backup\":{\"held\":false},"
+                            "\"restore\":{\"held\":false}"
+                        "},"
+                        "\"message\":\"ok\""
+                    "}"
+                "}"
+            "]",
+            // {uncrustify_on}
+            "json");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("backup set");
+
+        StringList *argListSet = strLstDup(argList);
+        hrnCfgArgRawZ(argListSet, cfgOptSet, "20200101-000000F");
+        HRN_CFG_LOAD(cfgCmdInfo, argListSet);
+
+        TEST_RESULT_STR_Z(
+            infoRender(),
+            "stanza: db\n"
+            "    status: ok\n"
+            "    cipher: aes-256-gcm\n"
+            "\n"
+            "    db (current)\n"
+            "        wal archive min/max (12): 000000010000000000000001/000000010000000000000002\n"
+            "\n"
+            "        full backup: 20200101-000000F\n"
+            "            timestamp start/stop: 2020-01-01 00:00:00+00 / 2020-01-01 00:00:02+00\n"
+            "            wal start/stop: 000000010000000000000001 / 000000010000000000000001\n"
+            "            database size: 19.2MB, database backup size: 19.2MB\n"
+            "            repo1: backup set size: 2.3MB, backup size: 2.3MB\n"
+            "            database list: postgres (13424)\n",
+            "text, database list read from the manifest");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("manifest of another backup is refused");
+
+        argListSet = strLstDup(argList);
+        hrnCfgArgRawZ(argListSet, cfgOptSet, "20200102-000000F");
+        HRN_CFG_LOAD(cfgCmdInfo, argListSet);
+
+        TEST_RESULT_STR_Z(
+            infoRender(),
+            "stanza: db\n"
+            "    status: error (other)\n"
+            "            [CryptoError] unable to load backup manifest file '" TEST_PATH "/repo-enc/backup/db/20200102-000000F/"
+            BACKUP_MANIFEST_FILE "':\n"
+            "            CryptoError: cipher segment 0 failed authentication\n"
+            "            HINT: is or was the repo encrypted?\n"
+            "    cipher: aes-256-gcm\n",
+            "text");
+
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

@@ -7,13 +7,9 @@ Common Functions and Definitions for Backup and Expire Commands
 
 #include "command/backup/common.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/log.h"
 #include "storage/helper.h"
-
-/***********************************************************************************************************************************
-Constants
-***********************************************************************************************************************************/
-#define BACKUP_LINK_LATEST                                          "latest"
 
 /**********************************************************************************************************************************/
 FN_EXTERN String *
@@ -42,6 +38,90 @@ backupFileRepoPath(const String *const backupLabel, const BackupFileRepoPathPara
     }
 
     FUNCTION_TEST_RETURN(STRING, result);
+}
+
+/***********************************************************************************************************************************
+Identity of a stream written by a backup for a file in its manifest
+***********************************************************************************************************************************/
+static StringList *
+backupCipherIdentity(const char *const kind, const String *const backupLabel, const String *const manifestName)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRINGZ, kind);
+        FUNCTION_TEST_PARAM(STRING, backupLabel);
+        FUNCTION_TEST_PARAM(STRING, manifestName);
+    FUNCTION_TEST_END();
+
+    ASSERT(kind != NULL);
+    ASSERT(backupLabel != NULL);
+    ASSERT(manifestName != NULL);
+
+    StringList *const result = strLstNew();
+
+    strLstAddZ(result, kind);
+    strLstAdd(result, backupLabel);
+    strLstAdd(result, manifestName);
+
+    FUNCTION_TEST_RETURN(STRING_LIST, result);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN StringList *
+backupFileCipherIdentity(const String *const backupLabel, const String *const manifestName)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, backupLabel);
+        FUNCTION_TEST_PARAM(STRING, manifestName);
+    FUNCTION_TEST_END();
+
+    FUNCTION_TEST_RETURN(STRING_LIST, backupCipherIdentity(CIPHER_IDENTITY_FILE, backupLabel, manifestName));
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN StringList *
+backupSuperBlockCipherIdentity(const String *const backupLabel, const String *const manifestName, const uint64_t offset)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, backupLabel);
+        FUNCTION_TEST_PARAM(STRING, manifestName);
+        FUNCTION_TEST_PARAM(UINT64, offset);
+    FUNCTION_TEST_END();
+
+    StringList *const result = backupCipherIdentity(CIPHER_IDENTITY_SUPER_BLOCK, backupLabel, manifestName);
+
+    strLstAddFmt(result, "%" PRIu64, offset);
+
+    FUNCTION_TEST_RETURN(STRING_LIST, result);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN StringList *
+backupBlockMapCipherIdentity(const String *const backupLabel, const String *const manifestName)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, backupLabel);
+        FUNCTION_TEST_PARAM(STRING, manifestName);
+    FUNCTION_TEST_END();
+
+    FUNCTION_TEST_RETURN(STRING_LIST, backupCipherIdentity(CIPHER_IDENTITY_BLOCK_MAP, backupLabel, manifestName));
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN StringList *
+backupManifestHistoryCipherIdentity(const String *const backupLabel)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, backupLabel);
+    FUNCTION_TEST_END();
+
+    ASSERT(backupLabel != NULL);
+
+    StringList *const result = strLstNew();
+
+    strLstAddZ(result, CIPHER_IDENTITY_MANIFEST_HISTORY);
+    strLstAdd(result, backupLabel);
+
+    FUNCTION_TEST_RETURN(STRING_LIST, result);
 }
 
 /**********************************************************************************************************************************/

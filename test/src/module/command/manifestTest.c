@@ -1,6 +1,8 @@
 /***********************************************************************************************************************************
 Test Manifest Command
 ***********************************************************************************************************************************/
+
+#include "common/crypto/cipherGcm.h"
 #include "storage/helper.h"
 
 #include "command/backup/common.h"
@@ -13,6 +15,10 @@ Test Manifest Command
 #include "harness/postgres.h"
 #include "harness/protocol.h"
 #include "harness/storage.h"
+
+/***********************************************************************************************************************************
+An aes-256-gcm repository key
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test Run
@@ -134,7 +140,7 @@ testRun(void)
             TEST_RESULT_VOID(hrnCmdBackup(), "backup repo1");
 
             // Munge the pg_control checksum since it will vary by architecture
-            Manifest *manifest = manifestLoadFile(
+            Manifest *manifest = manifestLoadFileP(
                 storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20191002-070640F_20191003-105320D/" BACKUP_MANIFEST_FILE),
                 cipherSpecNewNone());
 
@@ -580,6 +586,82 @@ testRun(void)
 
             TEST_RESULT_VOID(jsonToVar(cmdManifestRender()), "check json");
         }
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm block map");
+        {
+            HRN_STORAGE_PUT_Z(
+                storageTest, "pgbackrest-gcm.conf",
+                "[global]\n"
+                "repo1-path=" TEST_PATH "/repo3\n"
+                "repo1-retention-full=999\n"
+                "repo1-cipher-type=aes-256-gcm\n"
+                "repo1-cipher-pass=" TEST_CIPHER_KEY "\n"
+                "repo1-bundle=y\n"
+                "repo1-block=y\n"
+                "repo1-block-size-super-full=32KiB\n"
+                "\n"
+                "archive-check=n\n"
+                "compress-type=none\n"
+                "\n"
+                "[test]\n"
+                "pg1-path=" TEST_PATH "/pg1\n");
+
+            StringList *const argListGcm = strLstNew();
+            hrnCfgArgRawZ(argListGcm, cfgOptStanza, "test");
+            hrnCfgArgRawZ(argListGcm, cfgOptConfig, TEST_PATH "/pgbackrest-gcm.conf");
+
+            StringList *argList = strLstDup(argListGcm);
+            hrnCfgArgRawBool(argList, cfgOptOnline, false);
+            HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+            TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+
+            argList = strLstDup(argListGcm);
+            HRN_CFG_LOAD(cfgCmdManifest, argList);
+
+            TEST_ERROR(cmdManifestRender(), BackupSetInvalidError, "no backup sets to show");
+
+            argList = strLstDup(argListGcm);
+            hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+            HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+            hrnBackupPqScriptP(
+                PG_VERSION_14, BACKUP_EPOCH + 200000, .noArchiveCheck = true, .noWal = true, .cipherSpecMain = cfgCipherSpecMain());
+            TEST_RESULT_VOID(hrnCmdBackup(), "backup");
+
+            argList = strLstDup(argListGcm);
+            hrnCfgArgRawZ(argList, cfgOptFilter, MANIFEST_TARGET_PGDATA "/" PG_PATH_BASE "/1/2");
+            HRN_CFG_LOAD(cfgCmdManifest, argList);
+
+            const char *const render =
+                "label: 20191004-144000F\n"
+                "reference: 20191004-144000F\n"
+                "type: full\n"
+                "time: start: 2019-10-04 14:40:00, stop: 2019-10-05 05:13:47, duration: 14:33:47\n"
+                "bundle: true\n"
+                "block: true\n"
+                "\n"
+                "file list:\n"
+                "  - pg_data/base/1/2\n"
+                "      size: 96KB, repo 96.3KB\n"
+                "      checksum: d4976e362696a43fb09e7d4e780d7d9352a2ec2e\n"
+                "      bundle: 1\n"
+                "      block: size 8KB, map size 137B, checksum size 6B\n"
+                "      block delta:\n"
+                "        reference: 20191004-144000F/bundle/1, read: 1/96.2KB, superBlock: 3/96KB, block: 12/96KB\n"
+                "        total read: 1/96.2KB, superBlock: 3/96KB, block: 12/96KB\n";
+
+            // The latest backup is loaded under its label
+            TEST_RESULT_STR_Z(cmdManifestRender(), render, "latest");
+
+            hrnCfgArgRawZ(argList, cfgOptSet, "20191004-144000F");
+            HRN_CFG_LOAD(cfgCmdManifest, argList);
+
+            TEST_RESULT_STR_Z(cmdManifestRender(), render, "set");
+        }
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

@@ -1119,7 +1119,8 @@ cfgCipherSpecMainIdx(const unsigned int repoIdx)
 
             // The digest is unset because the format of the file this pass opens determines it
             configLocal->cipherSpecMain[repoIdx] = cipherSpecNewP(
-                cipherType, cipherType == cipherTypeNone ? NULL : BUFSTR(cfgOptionIdxStr(cfgOptRepoCipherPass, repoIdx)));
+                cipherType, cipherType == cipherTypeNone ? NULL : BUFSTR(cfgOptionIdxStr(cfgOptRepoCipherPass, repoIdx)),
+                .stanza = cfgOptionStrNull(cfgOptStanza));
         }
         MEM_CONTEXT_END();
     }

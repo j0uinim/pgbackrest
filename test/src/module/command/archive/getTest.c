@@ -1,15 +1,27 @@
 /***********************************************************************************************************************************
 Test Archive Get Command
 ***********************************************************************************************************************************/
+
+#include "common/crypto/cipherGcm.h"
 #include "common/io/fdRead.h"
 #include "common/io/fdWrite.h"
 
 #include "harness/config.h"
+#include "harness/crypto.h"
 #include "harness/fork.h"
 #include "harness/info.h"
 #include "harness/postgres.h"
 #include "harness/protocol.h"
 #include "harness/storage.h"
+
+/***********************************************************************************************************************************
+Keys and a WAL file for the aes-256-gcm cipher type
+***********************************************************************************************************************************/
+#define TEST_GCM_SHA1_A                                              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define TEST_GCM_SHA1_B                                              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define TEST_GCM_WAL                                                "10-1/01ABCDEF01ABCDEF01ABCDEF-" TEST_GCM_SHA1_A
+#define TEST_GCM_WAL_ASYNC_1                                        "10-1/000000010000000100000001-" TEST_GCM_SHA1_A
+#define TEST_GCM_WAL_ASYNC_2                                        "10-1/000000010000000100000002-" TEST_GCM_SHA1_B
 
 /***********************************************************************************************************************************
 Test Run
@@ -553,6 +565,130 @@ testRun(void)
             .remove = true);
         TEST_STORAGE_LIST(
             storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_IN, "000000010000000200000000.pgbackrest.tmp\n", .remove = true);
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm async WAL get, and a segment stored under the name of another");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc-async");
+        hrnCfgArgRawZ(argList, cfgOptSpoolPath, TEST_PATH "/spool");
+        hrnCfgArgRawBool(argList, cfgOptArchiveAsync, true);
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test2");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        strLstAddZ(argList, "000000010000000100000001");
+        strLstAddZ(argList, "000000010000000100000002");
+        HRN_CFG_LOAD(cfgCmdArchiveGet, argList, .role = cfgCmdRoleAsync);
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_ARCHIVE_PATH_FILE,
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_2 "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":" HRN_PG_SYSTEMID_10_Z ",\"db-version\":\"10\"}",
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test2")));
+
+        Buffer *const walGcm = bufNew(64 * 1024);
+        memset(bufPtr(walGcm), 0x5A, bufSize(walGcm));
+        bufUsedSet(walGcm, bufSize(walGcm));
+
+        // The first segment is stored under its own name, the second is the first segment's file stored under its own name
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_1, walGcm,
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_2), .stanza = STRDEF("test2")),
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|10-1/0000000100000001/000000010000000100000001-" TEST_GCM_SHA1_A));
+
+        const Buffer *const walGcmStored = storageGetP(
+            storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_1)));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(walGcmStored), 8)), "PGBR007G", "format 7 prefix");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_2, walGcmStored,
+            .comment = "first segment's file under the second segment's name");
+
+        TEST_RESULT_VOID(cmdArchiveGetAsync(), "get async");
+
+        TEST_RESULT_LOG(
+            "P00   INFO: get 2 WAL file(s) from archive: 000000010000000100000001...000000010000000100000002\n"
+            "P01 DETAIL: found 000000010000000100000001 in the repo1: 10-1 archive\n"
+            "P01   WARN: [FileReadError] raised from local-1 shim protocol: unable to get 000000010000000100000002:\n"
+            "            repo1: 10-1/0000000100000001/000000010000000100000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            " [CryptoError] cipher segment 0 failed authentication");
+
+        TEST_STORAGE_GET(
+            storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_IN "/000000010000000100000002.error",
+            "42\n"
+            "raised from local-1 shim protocol: unable to get 000000010000000100000002:\n"
+            "repo1: 10-1/0000000100000001/000000010000000100000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb [CryptoError]"
+            " cipher segment 0 failed authentication",
+            .remove = true);
+
+        const Buffer *const walGcmQueue = storageGetP(
+            storageNewReadP(storageSpool(), STRDEF(STORAGE_SPOOL_ARCHIVE_IN "/000000010000000100000001")));
+
+        TEST_RESULT_BOOL(bufEq(walGcmQueue, walGcm), true, "first segment in the queue");
+        TEST_STORAGE_LIST(
+            storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_IN,
+            "000000010000000100000001\n"
+            "000000010000000100000002.pgbackrest.tmp\n",
+            .remove = true);
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm async - file cut at a segment boundary is not queued");
+
+        // The second segment is stored under its own name as three cipher segments and then cut after the second of them, so the
+        // first has been decrypted and written when the second fails
+        Buffer *const walGcmLarge = bufNew(2 * 1024 * 1024 + 64 * 1024);
+        memset(bufPtr(walGcmLarge), 0x5B, bufSize(walGcmLarge));
+        bufUsedSet(walGcmLarge, bufSize(walGcmLarge));
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_2, walGcmLarge,
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_2), .stanza = STRDEF("test2")),
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|10-1/0000000100000001/000000010000000100000002-" TEST_GCM_SHA1_B));
+
+        const Buffer *const walGcmLargeStored = storageGetP(
+            storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_2)));
+
+        TEST_RESULT_UINT(bufUsed(walGcmLargeStored), 8 + 40 + bufUsed(walGcmLarge) + 16 * 3, "stored as three cipher segments");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL_ASYNC_2,
+            BUF(bufPtrConst(walGcmLargeStored), 8 + 2 * 1024 * 1024), .comment = "cut after the second cipher segment");
+
+        TEST_RESULT_VOID(cmdArchiveGetAsync(), "get async");
+
+        TEST_RESULT_LOG(
+            "P00   INFO: get 2 WAL file(s) from archive: 000000010000000100000001...000000010000000100000002\n"
+            "P01 DETAIL: found 000000010000000100000001 in the repo1: 10-1 archive\n"
+            "P01   WARN: [FileReadError] raised from local-1 shim protocol: unable to get 000000010000000100000002:\n"
+            "            repo1: 10-1/0000000100000001/000000010000000100000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            " [CryptoError] cipher segment 1 failed authentication");
+
+        TEST_STORAGE_GET(
+            storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_IN "/000000010000000100000002.error",
+            "42\n"
+            "raised from local-1 shim protocol: unable to get 000000010000000100000002:\n"
+            "repo1: 10-1/0000000100000001/000000010000000100000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb [CryptoError]"
+            " cipher segment 1 failed authentication",
+            .remove = true);
+
+        // What was decrypted before the failure stays under the temporary name, which is never moved to the WAL path
+        TEST_STORAGE_LIST(
+            storageSpoolWrite(), STORAGE_SPOOL_ARCHIVE_IN,
+            "000000010000000100000001\n"
+            "000000010000000100000002.pgbackrest.tmp\n",
+            .remove = true);
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("global error on invalid executable");
@@ -1178,6 +1314,128 @@ testRun(void)
         TEST_RESULT_INT(cmdArchiveGet(), 0, "get");
 
         TEST_RESULT_LOG("P00   INFO: found 01ABCDEF01ABCDEF01ABCDEF in the repo2: 10-1 archive");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - copy failing part way is replaced by next repo's");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 1, TEST_PATH "/repo-enc1");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 1, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+        hrnCfgArgKeyRawZ(argList, cfgOptRepoPath, 2, TEST_PATH "/repo-enc2");
+        hrnCfgArgKeyRawStrId(argList, cfgOptRepoCipherType, 2, cipherTypeAes256Gcm);
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 2, TEST_CIPHER_KEY_2);
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test1");
+        strLstAddZ(argList, "01ABCDEF01ABCDEF01ABCDEF");
+        strLstAddZ(argList, TEST_PATH "/pg/pg_wal/RECOVERYXLOG");
+        HRN_CFG_LOAD(cfgCmdArchiveGet, argList);
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 1);
+        hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 2);
+
+        // Each repo has its own key and so its own archive subpass
+        for (unsigned int repoIdx = 0; repoIdx < 2; repoIdx++)
+        {
+            const char *const key = repoIdx == 0 ? TEST_CIPHER_KEY : TEST_CIPHER_KEY_2;
+
+            HRN_INFO_PUT(
+                storageRepoIdxWrite(repoIdx), INFO_ARCHIVE_PATH_FILE,
+                "[cipher]\n"
+                "cipher-pass=\"" TEST_CIPHER_KEY_2 "\"\n"
+                "cipher-type=\"aes-256-gcm\"\n"
+                "\n"
+                "[db]\n"
+                "db-id=1\n"
+                "\n"
+                "[db:history]\n"
+                "1={\"db-id\":" HRN_PG_SYSTEMID_10_Z ",\"db-version\":\"10\"}",
+                .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRZ(key), .stanza = STRDEF("test1")));
+
+            HRN_STORAGE_PUT(
+                storageRepoIdxWrite(repoIdx), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL, buffer,
+                .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_2), .stanza = STRDEF("test1")),
+                .cipherIdentity = HRN_CIPHER_IDENTITY("archive|10-1/01ABCDEF01ABCDEF/01ABCDEF01ABCDEF01ABCDEF-" TEST_GCM_SHA1_A));
+        }
+
+        // Flip a bit in the fifth segment of the copy in repo1, so four segments are decrypted before it fails
+        Buffer *const walTamper = storageGetP(
+            storageNewReadP(storageRepoIdx(0), STRDEF(STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL)));
+
+        bufPtr(walTamper)[8 + 4 * 1024 * 1024 + 100] ^= 0x01;
+        HRN_STORAGE_PUT(storageRepoIdxWrite(0), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL, walTamper, .comment = "tamper repo1");
+
+        TEST_RESULT_INT(cmdArchiveGet(), 0, "get");
+
+        TEST_RESULT_LOG(
+            "P00   WARN: repo1: 10-1/01ABCDEF01ABCDEF/01ABCDEF01ABCDEF01ABCDEF-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            " [CryptoError] cipher segment 4 failed authentication\n"
+            "P00   INFO: found 01ABCDEF01ABCDEF01ABCDEF in the repo2: 10-1 archive");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF("pg_wal/RECOVERYXLOG"))), buffer), true, "WAL restored");
+        TEST_STORAGE_LIST(storagePgWrite(), "pg_wal", "RECOVERYXLOG\n", .remove = true);
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - file cut at a segment boundary, later get replaces it");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc2");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY_2);
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test1");
+        strLstAddZ(argList, "01ABCDEF01ABCDEF01ABCDEF");
+        strLstAddZ(argList, TEST_PATH "/pg/pg_wal/RECOVERYXLOG");
+        HRN_CFG_LOAD(cfgCmdArchiveGet, argList);
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        const Buffer *const walStored = storageGetP(
+            storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL)));
+
+        TEST_RESULT_UINT(bufUsed(walStored), 8 + 40 + bufUsed(buffer) + 16 * 17, "stored as 17 cipher segments");
+
+        // Cut after the second cipher segment, and after the last but one. The segment before the cut was not written as the last
+        // so it fails, after the segments before it have been decrypted and written to the destination. The command fails, so
+        // PostgreSQL does not use what was written.
+        const unsigned int cutList[] = {2, 16};
+
+        for (unsigned int cutIdx = 0; cutIdx < LENGTH_OF(cutList); cutIdx++)
+        {
+            HRN_STORAGE_PUT(
+                storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL,
+                BUF(bufPtrConst(walStored), 8 + cutList[cutIdx] * 1024 * 1024),
+                .comment = zNewFmt("cut after cipher segment %u", cutList[cutIdx] - 1));
+
+            TEST_ERROR_FMT(
+                cmdArchiveGet(), FileReadError,
+                "unable to get 01ABCDEF01ABCDEF01ABCDEF:\n"
+                "repo1: 10-1/01ABCDEF01ABCDEF/01ABCDEF01ABCDEF01ABCDEF-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa [CryptoError]"
+                " cipher segment %u failed authentication",
+                cutList[cutIdx] - 1);
+        }
+
+        // A cut that leaves no cipher segment
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL, BUF(bufPtrConst(walStored), 8 + 40),
+            .comment = "cut after the cipher header");
+
+        TEST_ERROR(
+            cmdArchiveGet(), FileReadError,
+            "unable to get 01ABCDEF01ABCDEF01ABCDEF:\n"
+            "repo1: 10-1/01ABCDEF01ABCDEF/01ABCDEF01ABCDEF01ABCDEF-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa [CryptoError] cipher"
+            " stream is truncated");
+
+        // Once the file is whole again the get replaces what the failed gets left in the destination
+        HRN_STORAGE_PUT(storageRepoWrite(), STORAGE_REPO_ARCHIVE "/" TEST_GCM_WAL, walStored, .comment = "whole file");
+
+        TEST_RESULT_INT(cmdArchiveGet(), 0, "get");
+        TEST_RESULT_LOG("P00   INFO: found 01ABCDEF01ABCDEF01ABCDEF in the repo1: 10-1 archive");
+
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storagePg(), STRDEF("pg_wal/RECOVERYXLOG"))), buffer), true, "WAL restored");
+        TEST_STORAGE_LIST(storagePgWrite(), "pg_wal", "RECOVERYXLOG\n", .remove = true);
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("no segments to find with existing ok file");

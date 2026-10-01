@@ -10,8 +10,10 @@ Configuration Load
 
 #include "command/command.h"
 #include "command/lock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/crypto/common.h"
 #include "common/debug.h"
+#include "common/format/format.h"
 #include "common/io/io.h"
 #include "common/io/socket/common.h"
 #include "common/io/tls/common.h"
@@ -75,6 +77,81 @@ cfgLoadLogSetting(void)
 
 /**********************************************************************************************************************************/
 FN_EXTERN void
+cfgLoadRepoCipher(const unsigned int repoIdx, const CipherType cipherType, const String *const cipherPass)
+{
+    FUNCTION_LOG_BEGIN(logLevelTrace);
+        FUNCTION_LOG_PARAM(UINT, repoIdx);
+        FUNCTION_LOG_PARAM(STRING_ID, cipherType);
+        FUNCTION_TEST_PARAM(STRING, cipherPass);                    // Not logged since the key is secret
+    FUNCTION_LOG_END();
+
+    FUNCTION_AUDIT_HELPER();
+
+    ASSERT(cfgOptionValid(cfgOptRepoCipherType));
+    ASSERT(repoIdx < cfgOptionGroupIdxTotal(cfgOptGrpRepo));
+
+    const bool gcm = cipherType == cipherTypeAes256Gcm;
+
+    // The format follows the cipher. When the format is not given for a command that sets it, it is the one the cipher requires,
+    // and a format that disagrees with the cipher is an error in either direction.
+    if (cfgOptionValid(cfgOptRepoFormat))
+    {
+        if (gcm && cfgOptionIdxSource(cfgOptRepoFormat, repoIdx) == cfgSourceDefault)
+            cfgOptionIdxSet(cfgOptRepoFormat, repoIdx, cfgSourceDefault, VARINT64(REPOSITORY_FORMAT_7));
+
+        if (gcm != (cfgOptionIdxUInt(cfgOptRepoFormat, repoIdx) == REPOSITORY_FORMAT_7))
+        {
+            THROW_FMT(
+                OptionInvalidValueError,
+                "'%s' is not valid for '%s' option with '%s' option '%s'\n"
+                "HINT: repository format " STRINGIFY(REPOSITORY_FORMAT_7) " is written with cipher type aes-256-gcm only.",
+                strZ(cfgOptionIdxDisplay(cfgOptRepoFormat, repoIdx)), cfgOptionIdxName(cfgOptRepoFormat, repoIdx),
+                cfgOptionIdxName(cfgOptRepoCipherType, repoIdx), strZ(strNewStrId(cipherType)));
+        }
+    }
+
+    // A repository encrypted with aes-256-gcm is keyed with random bytes rather than with a passphrase, and is its own identity, so
+    // each key is checked before anything in the repository is read or written
+    if (gcm)
+    {
+#ifndef CIPHER_GCM_SUPPORTED
+        THROW_FMT(
+            OptionInvalidValueError, "'aes-256-gcm' is not valid for '%s' option\n"
+            "HINT: cipher type aes-256-gcm requires OpenSSL 3.0.8 or later.",
+            cfgOptionIdxName(cfgOptRepoCipherType, repoIdx));
+#endif
+        // The key is not shown in an error since it is secret
+        if (cipherPass == NULL || !cipherGcmKeyValid(BUFSTR(cipherPass)))
+        {
+            THROW_FMT(
+                OptionInvalidValueError,
+                "'%s' option must be the base64 of exactly " STRINGIFY(CIPHER_GCM_KEY_SIZE) " random bytes\n"
+                "HINT: generate a key with 'openssl rand -base64 " STRINGIFY(CIPHER_GCM_KEY_SIZE) "'.",
+                cfgOptionIdxName(cfgOptRepoCipherPass, repoIdx));
+        }
+
+        // Two repositories with the same key could each open the other's files, so a key may only be used once. A key is valid only
+        // in its canonical base64, which is one string per key, so the same key is the same text. A passphrase of aes-256-cbc is
+        // used as text, so it is the same key when it is the same text. Only the keys this process knows can be compared: a key
+        // fetched from a repository host is compared when it is fetched.
+        for (unsigned int repoOtherIdx = 0; repoOtherIdx < cfgOptionGroupIdxTotal(cfgOptGrpRepo); repoOtherIdx++)
+        {
+            if (repoOtherIdx != repoIdx && cfgOptionIdxStrId(cfgOptRepoCipherType, repoOtherIdx) != cipherTypeNone &&
+                strEq(cipherPass, cfgOptionIdxStr(cfgOptRepoCipherPass, repoOtherIdx)))
+            {
+                THROW_FMT(
+                    OptionInvalidValueError, "'%s' and '%s' options must not be the same key",
+                    cfgOptionIdxName(cfgOptRepoCipherPass, repoOtherIdx < repoIdx ? repoOtherIdx : repoIdx),
+                    cfgOptionIdxName(cfgOptRepoCipherPass, repoOtherIdx < repoIdx ? repoIdx : repoOtherIdx));
+            }
+        }
+    }
+
+    FUNCTION_LOG_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
 cfgLoadUpdateOption(void)
 {
     FUNCTION_LOG_VOID(logLevelTrace);
@@ -118,6 +195,19 @@ cfgLoadUpdateOption(void)
                     }
                 }
             }
+        }
+    }
+
+    // Check the cipher options of each repository. The cipher of a repository on a repository host may be configured on that host
+    // only, in which case the options are checked when they are fetched from it (see protocolRemoteGet()).
+    if (cfgOptionValid(cfgOptRepoCipherType))
+    {
+        for (unsigned int repoIdx = 0; repoIdx < cfgOptionGroupIdxTotal(cfgOptGrpRepo); repoIdx++)
+        {
+            const CipherType cipherType = cfgOptionIdxStrId(cfgOptRepoCipherType, repoIdx);
+
+            if (!cfgOptionIdxTest(cfgOptRepoHost, repoIdx) || cipherType != cipherTypeNone)
+                cfgLoadRepoCipher(repoIdx, cipherType, cfgOptionIdxStrNull(cfgOptRepoCipherPass, repoIdx));
         }
     }
 

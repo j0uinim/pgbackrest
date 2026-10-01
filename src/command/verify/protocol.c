@@ -42,11 +42,12 @@ verifyFileProtocol(PackRead *const param)
         const Buffer *const fileChecksum = pckReadBinP(param);
         const uint64_t fileSize = pckReadU64P(param);
         const CipherSpec *const cipherSpec = cipherSpecNewPack(param);
+        const StringList *const cipherIdentity = pckReadStrLstP(param);
 
         // Return result
         pckWriteU32P(
             protocolServerResultData(result),
-            verifyFile(filePathName, offset, limit, compressType, fileChecksum, fileSize, cipherSpec));
+            verifyFile(filePathName, offset, limit, compressType, fileChecksum, fileSize, cipherSpec, cipherIdentity));
     }
     MEM_CONTEXT_TEMP_END();
 

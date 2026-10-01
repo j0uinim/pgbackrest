@@ -10,7 +10,7 @@ Backup Info Handler
 
 #include "command/backup/common.h"
 #include "common/debug.h"
-#include "common/format/cipherBlockFormat.h"
+#include "common/format/cipherFormat.h"
 #include "common/ini.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/io.h"
@@ -716,7 +716,7 @@ infoBackupLoadFileCallback(void *const data, const unsigned int try)
 
             // Attempt to load the file
             IoRead *const read = storageReadIo(storageNewReadP(loadData->storage, fileName));
-            cipherBlockFormatFilterGroupReadAdd(ioReadFilterGroup(read), loadData->cipherSpec);
+            cipherFormatInfoReadAdd(ioReadFilterGroup(read), loadData->cipherSpec, INFO_BACKUP_FILE);
 
             MEM_CONTEXT_BEGIN(loadData->memContext)
             {
@@ -881,7 +881,7 @@ infoBackupLoadFileReconstruct(
                 if (storageExistsP(storage, manifestFileName))
                 {
                     bool found = false;
-                    const Manifest *const manifest = manifestLoadFile(storage, manifestFileName, infoBackupCipherSpec(infoBackup));
+                    const Manifest *const manifest = manifestLoadFileP(storage, manifestFileName, infoBackupCipherSpec(infoBackup));
                     const ManifestData *const manData = manifestData(manifest);
 
                     // If the pg data for the manifest exists in the history, then add it to current, but if something doesn't match
@@ -938,7 +938,7 @@ infoBackupSaveFile(
             // Write output into a buffer since it needs to be saved to storage twice
             Buffer *const buffer = bufNew(ioBufferSize());
             IoWrite *const write = ioBufferWriteNew(buffer);
-            cipherBlockFormatFilterGroupWriteAdd(buffer, ioWriteFilterGroup(write), cipherSpec, infoBackupFormat(infoBackup));
+            cipherFormatInfoWriteAdd(buffer, ioWriteFilterGroup(write), cipherSpec, infoBackupFormat(infoBackup), INFO_BACKUP_FILE);
             infoBackupSave(infoBackup, write);
 
             // Save the file and make a copy

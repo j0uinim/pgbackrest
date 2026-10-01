@@ -5,10 +5,11 @@ Block Incremental Filter
 
 #include "command/backup/blockIncr.h"
 #include "command/backup/blockMap.h"
+#include "command/backup/common.h"
 #include "common/compress/helper.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/crypto/xxhash.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/filter/buffer.h"
@@ -28,7 +29,9 @@ typedef struct BlockIncr
 
     StringId compressType;                                          // Compress filter type
     const Pack *compressParam;                                      // Compress filter parameters
-    const Pack *encryptParam;                                       // Encrypt filter parameters
+    const CipherSpec *cipherSpec;                                   // Cipher spec to encrypt each super block and the map with
+    const String *backupLabel;                                      // Label of the backup, which the streams are bound to
+    const String *manifestName;                                     // Manifest name of the file, which the streams are bound to
 
     unsigned int blockNo;                                           // Block number
     uint64_t superBlockNo;                                          // Block no in super block
@@ -150,9 +153,16 @@ blockIncrProcess(THIS_VOID, const Buffer *const input, Buffer *const output)
                                 compressFilterPack(this->compressType, this->compressParam));
                         }
 
-                        // Add encrypt filter
-                        if (this->encryptParam != NULL)
-                            ioFilterGroupAdd(ioWriteFilterGroup(this->blockOutWrite), cipherBlockNewPack(this->encryptParam));
+                        // Add encrypt filter. The super block begins at the current offset, which is recorded in its map items.
+                        if (cipherSpecType(this->cipherSpec) != cipherTypeNone)
+                        {
+                            ioFilterGroupAdd(
+                                ioWriteFilterGroup(this->blockOutWrite),
+                                cipherFormatNewP(
+                                    cipherModeEncrypt, this->cipherSpec,
+                                    backupSuperBlockCipherIdentity(this->backupLabel, this->manifestName, this->blockOffset),
+                                    .raw = true));
+                        }
 
                         // Add size filter
                         ioFilterGroupAdd(ioWriteFilterGroup(this->blockOutWrite), ioSizeNew());
@@ -248,8 +258,14 @@ blockIncrProcess(THIS_VOID, const Buffer *const input, Buffer *const output)
                 // Write the map
                 IoWrite *const write = ioBufferWriteNew(this->blockOut);
 
-                if (this->encryptParam != NULL)
-                    ioFilterGroupAdd(ioWriteFilterGroup(write), cipherBlockNewPack(this->encryptParam));
+                if (cipherSpecType(this->cipherSpec) != cipherTypeNone)
+                {
+                    ioFilterGroupAdd(
+                        ioWriteFilterGroup(write),
+                        cipherFormatNewP(
+                            cipherModeEncrypt, this->cipherSpec,
+                            backupBlockMapCipherIdentity(this->backupLabel, this->manifestName), .raw = true));
+                }
 
                 // Write the map
                 ioWriteOpen(write);
@@ -364,7 +380,7 @@ FN_EXTERN IoFilter *
 blockIncrNew(
     const uint64_t superBlockSize, const size_t blockSize, const size_t checksumSize, const unsigned int reference,
     const uint64_t bundleId, const uint64_t bundleOffset, const Buffer *const blockMapPrior, const IoFilter *const compress,
-    const IoFilter *const encrypt)
+    const CipherSpec *const cipherSpec, const String *const backupLabel, const String *const manifestName)
 {
     FUNCTION_LOG_BEGIN(logLevelTrace);
         FUNCTION_LOG_PARAM(UINT64, superBlockSize);
@@ -375,8 +391,17 @@ blockIncrNew(
         FUNCTION_LOG_PARAM(UINT64, bundleOffset);
         FUNCTION_LOG_PARAM(BUFFER, blockMapPrior);
         FUNCTION_LOG_PARAM(IO_FILTER, compress);
-        FUNCTION_LOG_PARAM(IO_FILTER, encrypt);
+        FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpec);
+        FUNCTION_LOG_PARAM(STRING, backupLabel);
+        FUNCTION_LOG_PARAM(STRING, manifestName);
     FUNCTION_LOG_END();
+
+    ASSERT(cipherSpec != NULL);
+
+    // The streams are bound to the label and the manifest name, which may have come from a pack, so check them at run time
+    CHECK(
+        AssertError, cipherSpecType(cipherSpec) == cipherTypeNone || (backupLabel != NULL && manifestName != NULL),
+        "backup label and manifest name are required to encrypt");
 
     OBJ_NEW_BEGIN(BlockIncr, .childQty = MEM_CONTEXT_QTY_MAX)
     {
@@ -391,6 +416,9 @@ blockIncrNew(
             .block = bufNew(blockSize),
             .blockOut = bufNew(0),
             .blockMapOut = blockMapNew(),
+            .cipherSpec = cipherSpecDupP(cipherSpec),
+            .backupLabel = strDup(backupLabel),
+            .manifestName = strDup(manifestName),
         };
 
         // Duplicate compress filter
@@ -399,10 +427,6 @@ blockIncrNew(
             this->compressType = ioFilterType(compress);
             this->compressParam = pckDup(ioFilterParamList(compress));
         }
-
-        // Duplicate encrypt filter
-        if (encrypt != NULL)
-            this->encryptParam = pckDup(ioFilterParamList(encrypt));
 
         // Load prior block map
         if (blockMapPrior)
@@ -441,7 +465,9 @@ blockIncrNew(
         if (this->compressParam != NULL)
             pckWriteStrIdP(packWrite, this->compressType);
 
-        pckWritePackP(packWrite, this->encryptParam);
+        cipherSpecPack(packWrite, cipherSpec);
+        pckWriteStrP(packWrite, backupLabel);
+        pckWriteStrP(packWrite, manifestName);
 
         pckWriteEndP(packWrite);
 
@@ -479,16 +505,15 @@ blockIncrNewPack(const Pack *const paramList)
         if (compressParam != NULL)
             compress = compressFilterPack(pckReadStrIdP(paramListPack), compressParam);
 
-        // Create encrypt filter
-        const Pack *const encryptParam = pckReadPackP(paramListPack);
-        const IoFilter *encrypt = NULL;
-
-        if (encryptParam != NULL)
-            encrypt = cipherBlockNewPack(encryptParam);
+        // Cipher spec and the identity the streams are bound to
+        const CipherSpec *const cipherSpec = cipherSpecNewPack(paramListPack);
+        const String *const backupLabel = pckReadStrP(paramListPack);
+        const String *const manifestName = pckReadStrP(paramListPack);
 
         result = ioFilterMove(
             blockIncrNew(
-                superBlockSize, blockSize, checksumSize, reference, bundleId, bundleOffset, blockMapPrior, compress, encrypt),
+                superBlockSize, blockSize, checksumSize, reference, bundleId, bundleOffset, blockMapPrior, compress, cipherSpec,
+                backupLabel, manifestName),
             memContextPrior());
     }
     MEM_CONTEXT_TEMP_END();

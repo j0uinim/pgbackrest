@@ -18,9 +18,10 @@ Format numbers
 ***********************************************************************************************************************************/
 #define REPOSITORY_FORMAT_5                                         5
 #define REPOSITORY_FORMAT_6                                         6
+#define REPOSITORY_FORMAT_7                                         7
 
 #define REPOSITORY_FORMAT_MIN                                       REPOSITORY_FORMAT_5
-#define REPOSITORY_FORMAT_MAX                                       REPOSITORY_FORMAT_6
+#define REPOSITORY_FORMAT_MAX                                       REPOSITORY_FORMAT_7
 
 /***********************************************************************************************************************************
 Functions

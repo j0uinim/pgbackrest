@@ -3,6 +3,10 @@ Block Restore
 
 Calculate and return the blocks required to restore a file using an optional block checksum list. The block checksum list is
 optional because the file to restore may not exist so all the blocks will need to be restored.
+
+When the repository is encrypted each super block is decrypted as the stream it was written as. With aes-256-gcm it is bound to the
+label of the backup that wrote it, found in the reference list by the reference in the block map, to the manifest name of the file
+and to its offset (see backupSuperBlockCipherIdentity()), so the reference list and the manifest name are required.
 ***********************************************************************************************************************************/
 #ifndef COMMAND_BACKUP_BLOCKDELTA_H
 #define COMMAND_BACKUP_BLOCKDELTA_H
@@ -38,7 +42,8 @@ Constructors
 ***********************************************************************************************************************************/
 FN_EXTERN BlockDelta *blockDeltaNew(
     const BlockMap *blockMap, size_t blockSize, size_t checksumSize, const Buffer *blockChecksum,
-    const CipherSpec *cipherSpecBackup, const CompressType compressType);
+    const CipherSpec *cipherSpecBackup, const StringList *referenceList, const String *manifestName,
+    const CompressType compressType);
 
 /***********************************************************************************************************************************
 Functions

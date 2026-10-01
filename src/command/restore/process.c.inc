@@ -429,11 +429,14 @@ restoreJobCallback(void *const data, const unsigned int clientIdx)
                     else
                         fileName = file.name;
 
+                    // The backup that wrote the file
+                    const String *const backupLabel =
+                        file.reference != NULL ? file.reference : manifestData(jobData->manifest)->backupLabel;
+
                     pckWriteStrP(
                         param,
                         backupFileRepoPathP(
-                            file.reference != NULL ? file.reference : manifestData(jobData->manifest)->backupLabel,
-                            .manifestName = file.name, .bundleId = file.bundleId,
+                            backupLabel, .manifestName = file.name, .bundleId = file.bundleId,
                             .compressType = manifestData(jobData->manifest)->backupOptionCompressType,
                             .blockIncr = file.blockIncrMapSize != 0));
                     pckWriteU32P(param, jobData->repoIdx);
@@ -443,6 +446,7 @@ restoreJobCallback(void *const data, const unsigned int clientIdx)
                     pckWriteBoolP(param, cfgOptionBool(cfgOptDelta) && cfgOptionBool(cfgOptForce));
                     pckWriteBoolP(param, file.bundleId != 0 && manifestData(jobData->manifest)->bundleRaw);
                     cipherSpecPack(param, jobData->cipherSpecBackup);
+                    pckWriteStrP(param, backupLabel);
                     pckWriteStrLstP(param, manifestReferenceList(jobData->manifest));
 
                     fileAdded = true;

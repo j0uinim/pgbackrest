@@ -1,16 +1,32 @@
 /***********************************************************************************************************************************
 Test Repo Commands
 ***********************************************************************************************************************************/
+
+#include "command/archive/common.h"
+#include "command/backup/common.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "storage/posix/storage.h"
 
 #include "harness/config.h"
+#include "harness/crypto.h"
 #include "harness/info.h"
 #include "harness/storageHelper.h"
 
 #include "info/infoArchive.h"
 #include "info/infoBackup.h"
+
+/***********************************************************************************************************************************
+aes-256-gcm keys: the key of the repository, and the subkeys of the archive, of the manifests and of each backup
+***********************************************************************************************************************************/
+#define TEST_GCM_LABEL_1                                            "20200101-000000F"
+#define TEST_GCM_LABEL_2                                            "20200102-000000F"
+#define TEST_GCM_WAL_1                                                                                                             \
+    "12-1/0000000100000001/000000010000000100000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define TEST_GCM_WAL_2                                                                                                             \
+    "12-1/0000000100000001/000000010000000100000002-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define TEST_GCM_FILE_CHECKSUM                                      "184473f470864e067ee3a22e64b47b0a1c356f29"
 
 /***********************************************************************************************************************************
 Test Run
@@ -671,6 +687,297 @@ testRun(void)
         writeBuffer = bufNew(0);
         TEST_RESULT_INT(storageGetProcess(ioBufferWriteNew(writeBuffer)), 0, "get");
         TEST_RESULT_BOOL(bufEq(writeBuffer, backupLabelBuffer), true, "get matches put");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm repository");
+
+        // Each file is bound to the identity its place in the repository gives it, with the stanza from the path, so no stanza
+        // option is given below
+        hrnCfgEnvKeyRawZ(cfgOptRepoCipherPass, 1, TEST_CIPHER_KEY);
+
+        const Storage *const storageGcm = storagePosixNewP(STRDEF(TEST_PATH "/repo-enc"), .write = true);
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test"));
+        const CipherSpec *const cipherSpecGcmArchive = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_ARCHIVE), .stanza = STRDEF("test"));
+        const CipherSpec *const cipherSpecGcmManifest = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_MANIFEST), .stanza = STRDEF("test"));
+        const CipherSpec *const cipherSpecGcmBackup = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_BACKUP), .stanza = STRDEF("test"));
+
+        const char *const archiveInfoGcm =
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_ARCHIVE "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":6846378200844646865,\"db-version\":\"12\"}\n";
+        const char *const backupInfoGcm =
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_MANIFEST "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-catalog-version\":201909212,\"db-control-version\":1201,\"db-system-id\":6846378200844646865"
+            ",\"db-version\":\"12\"}\n";
+
+        // Backup 1 is not compressed. It has a file with the name of a manifest, a block incremental file, and files whose names
+        // end with the extension of a block incremental file.
+        const char *const manifestGcm1 =
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_BACKUP "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[backup:db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[backup:option]\n"
+            "option-compress-type=\"none\"\n"
+            "\n"
+            "[backup:target]\n"
+            "pg_data={\"path\":\"/var/lib/pgsql/12/data\",\"type\":\"path\"}\n"
+            "\n"
+            "[target:file]\n"
+            "pg_data/backup.manifest={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "pg_data/base/1/2={\"bi\":1,\"bim\":31,\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":8192"
+            ",\"timestamp\":1565282114}\n"
+            "pg_data/base/1/3={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "pg_data/base/1/3.pgbi={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "pg_data/base/1/4.pgbi={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "\n"
+            "[target:file:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0600\"\n"
+            "user=\"user1\"\n";
+
+        // Backup 2 is compressed with gz
+        const char *const manifestGcm2 =
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_BACKUP "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[backup:db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[backup:option]\n"
+            "option-compress-type=\"gz\"\n"
+            "\n"
+            "[backup:target]\n"
+            "pg_data={\"path\":\"/var/lib/pgsql/12/data\",\"type\":\"path\"}\n"
+            "\n"
+            "[target:file]\n"
+            "pg_data/PG_VERSION={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "pg_data/base/1/3.pgbi={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"size\":4,\"timestamp\":1565282114}\n"
+            "pg_data/base/1/5={\"checksum\":\"" TEST_GCM_FILE_CHECKSUM "\",\"reference\":\"" TEST_GCM_LABEL_1 "\",\"size\":4"
+            ",\"timestamp\":1565282114}\n"
+            "\n"
+            "[target:file:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0600\"\n"
+            "user=\"user1\"\n";
+
+        const Buffer *const fileGcm = BUFSTRDEF("GCMFILE");
+
+        HRN_INFO_PUT(storageGcm, STORAGE_PATH_ARCHIVE "/test/" INFO_ARCHIVE_FILE, archiveInfoGcm, .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(storageGcm, STORAGE_PATH_BACKUP "/test/" INFO_BACKUP_FILE, backupInfoGcm, .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" INFO_BACKUP_FILE INFO_COPY_EXT, backupInfoGcm, .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/" BACKUP_MANIFEST_FILE, manifestGcm1,
+            .cipherSpec = cipherSpecGcmManifest);
+        HRN_INFO_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, manifestGcm1,
+            .cipherSpec = cipherSpecGcmManifest);
+        HRN_INFO_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/" BACKUP_MANIFEST_FILE, manifestGcm2,
+            .cipherSpec = cipherSpecGcmManifest);
+
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_ARCHIVE "/test/" TEST_GCM_WAL_1, fileGcm, .cipherSpec = cipherSpecGcmArchive,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|" TEST_GCM_WAL_1));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_ARCHIVE "/test/" TEST_GCM_WAL_2, fileGcm, .cipherSpec = cipherSpecGcmArchive,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("archive|" TEST_GCM_WAL_1), .comment = "segment 1 stored as segment 2");
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" BACKUP_PATH_HISTORY "/2020/" TEST_GCM_LABEL_1 ".manifest.gz", fileGcm,
+            .cipherSpec = cipherSpecGcmManifest, .cipherIdentity = HRN_CIPHER_IDENTITY("manifest-history|" TEST_GCM_LABEL_1));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/backup.manifest", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_1 "|pg_data/backup.manifest"));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/3.pgbi", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_1 "|pg_data/base/1/3.pgbi"));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/4.pgbi", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_1 "|pg_data/base/1/3.pgbi"),
+            .comment = "3.pgbi stored as 4.pgbi");
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/PG_VERSION.gz", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_2 "|pg_data/PG_VERSION"));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/3.pgbi.gz", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup,
+            .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_1 "|pg_data/base/1/3.pgbi"),
+            .comment = "backup 1 file stored in backup 2");
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/5.gz", fileGcm,
+            .cipherSpec = cipherSpecGcmBackup, .cipherIdentity = HRN_CIPHER_IDENTITY("file|" TEST_GCM_LABEL_1 "|pg_data/base/1/5"),
+            .comment = "backup 1 file hard linked into backup 2");
+
+        StringList *const argListGcm = strLstNew();
+        hrnCfgArgRawZ(argListGcm, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawStrId(argListGcm, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+
+        // Each file the path of which is given gets the content that was put
+        const char *const fileGcmList[] =
+        {
+            STORAGE_PATH_ARCHIVE "/test/" TEST_GCM_WAL_1,
+            STORAGE_PATH_BACKUP "/test/" BACKUP_PATH_HISTORY "/2020/" TEST_GCM_LABEL_1 ".manifest.gz",
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/backup.manifest",
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/3.pgbi",
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/PG_VERSION.gz",
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/5.gz",
+        };
+
+        for (unsigned int fileIdx = 0; fileIdx < LENGTH_OF(fileGcmList); fileIdx++)
+        {
+            argList = strLstDup(argListGcm);
+            hrnCfgArgRawZ(argList, cfgOptStanza, "test");
+            strLstAddZ(argList, fileGcmList[fileIdx]);
+            HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+            writeBuffer = bufNew(0);
+            TEST_RESULT_INT(storageGetProcess(ioBufferWriteNew(writeBuffer)), 0, zNewFmt("get %s", fileGcmList[fileIdx]));
+            TEST_RESULT_BOOL(bufEq(writeBuffer, fileGcm), true, "get matches put");
+        }
+
+        // Each info file and manifest gets its content, with its checksum
+        const char *const infoGcmList[][2] =
+        {
+            {STORAGE_PATH_ARCHIVE "/test/" INFO_ARCHIVE_FILE, archiveInfoGcm},
+            {STORAGE_PATH_BACKUP "/test/" INFO_BACKUP_FILE, backupInfoGcm},
+            {STORAGE_PATH_BACKUP "/test/" INFO_BACKUP_FILE INFO_COPY_EXT, backupInfoGcm},
+            {STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/" BACKUP_MANIFEST_FILE, manifestGcm1},
+            {STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, manifestGcm1},
+        };
+
+        for (unsigned int infoIdx = 0; infoIdx < LENGTH_OF(infoGcmList); infoIdx++)
+        {
+            argList = strLstDup(argListGcm);
+            strLstAddZ(argList, infoGcmList[infoIdx][0]);
+            HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+            writeBuffer = bufNew(0);
+            TEST_RESULT_INT(storageGetProcess(ioBufferWriteNew(writeBuffer)), 0, zNewFmt("get %s", infoGcmList[infoIdx][0]));
+            TEST_RESULT_BOOL(
+                bufEq(writeBuffer, harnessInfoChecksumFormat(REPOSITORY_FORMAT_7, STR(infoGcmList[infoIdx][1]))), true,
+                "get matches put");
+        }
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm file under another identity");
+
+        // Each file was put under the identity of another file: archive.info of stanza test in the path of stanza other, and the
+        // final manifest of backup 1 as the in-progress copy of backup 2
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_ARCHIVE "/other/" INFO_ARCHIVE_FILE,
+            storageGetP(storageNewReadP(storageGcm, STRDEF(STORAGE_PATH_ARCHIVE "/test/" INFO_ARCHIVE_FILE))));
+        HRN_STORAGE_PUT(
+            storageGcm, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT,
+            storageGetP(
+                storageNewReadP(storageGcm, STRDEF(STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/" BACKUP_MANIFEST_FILE))));
+
+        const char *const fileGcmSwapList[] =
+        {
+            STORAGE_PATH_ARCHIVE "/other/" INFO_ARCHIVE_FILE,
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT,
+            STORAGE_PATH_ARCHIVE "/test/" TEST_GCM_WAL_2,
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/4.pgbi",
+            STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/3.pgbi.gz",
+        };
+
+        for (unsigned int fileIdx = 0; fileIdx < LENGTH_OF(fileGcmSwapList); fileIdx++)
+        {
+            argList = strLstDup(argListGcm);
+            strLstAddZ(argList, fileGcmSwapList[fileIdx]);
+            HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+            TEST_ERROR(
+                storageGetProcess(ioBufferWriteNew(bufNew(0))), CryptoError, "cipher segment 0 failed authentication");
+        }
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm file that cannot be fetched alone");
+
+        argList = strLstDup(argListGcm);
+        strLstAddZ(argList, STORAGE_PATH_BACKUP "/test/latest/" BACKUP_MANIFEST_FILE);
+        HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+        TEST_ERROR(
+            storageGetProcess(ioBufferWriteNew(bufNew(0))), OptionInvalidValueError,
+            "unable to determine cipher identity for '" STORAGE_PATH_BACKUP "/test/latest/" BACKUP_MANIFEST_FILE "'\n"
+            "HINT: a backup encrypted with aes-256-gcm is bound to its label, so give the label rather than 'latest'.");
+
+        argList = strLstDup(argListGcm);
+        strLstAddZ(argList, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/bundle/1");
+        HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+        TEST_ERROR(
+            storageGetProcess(ioBufferWriteNew(bufNew(0))), OptionInvalidValueError,
+            "unable to determine cipher identity for '" STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/bundle/1'\n"
+            "HINT: a bundle holds each of its files as a stream of its own, so it cannot be fetched alone.");
+
+        argList = strLstDup(argListGcm);
+        strLstAddZ(argList, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/2.pgbi");
+        HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+        TEST_ERROR(
+            storageGetProcess(ioBufferWriteNew(bufNew(0))), OptionInvalidValueError,
+            "unable to determine cipher identity for '" STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/pg_data/base/1/2.pgbi'\n"
+            "HINT: a block incremental file holds each of its super blocks and its map as a stream of its own, so it cannot be"
+            " fetched alone.");
+
+        argList = strLstDup(argListGcm);
+        strLstAddZ(argList, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/backup_label");
+        HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+        TEST_ERROR(
+            storageGetProcess(ioBufferWriteNew(bufNew(0))), OptionInvalidValueError,
+            "unable to determine cipher identity for '" STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_1 "/backup_label'\n"
+            "HINT: a file of a backup is stored in a path of the backup, e.g. pg_data.");
+
+        argList = strLstDup(argListGcm);
+        strLstAddZ(argList, STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/6.gz");
+        HRN_CFG_LOAD(cfgCmdRepoGet, argList);
+
+        TEST_ERROR(
+            storageGetProcess(ioBufferWriteNew(bufNew(0))), OptionInvalidValueError,
+            "unable to determine cipher identity for '" STORAGE_PATH_BACKUP "/test/" TEST_GCM_LABEL_2 "/pg_data/base/1/6.gz'\n"
+            "HINT: the file is not in the manifest of its backup.");
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         // Reset env

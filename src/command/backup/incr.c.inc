@@ -50,7 +50,7 @@ backupBuildIncrPrior(const InfoBackup *const infoBackup)
             // If there is a prior backup then check that options for the new backup are compatible
             if (backupLabelPrior != NULL)
             {
-                result = manifestLoadFile(
+                result = manifestLoadFileP(
                     storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabelPrior)),
                     infoBackupCipherSpec(infoBackup));
                 const ManifestData *const manifestPriorData = manifestData(result);

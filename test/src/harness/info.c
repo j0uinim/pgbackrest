@@ -9,12 +9,16 @@ Harness for Loading Test Configurations
 #include "common/crypto/cipherBlock.h"
 #include "common/crypto/hash.h"
 #include "common/format/cipherBlockFormat.h"
+#include "common/format/cipherFormat.h"
 #include "common/format/format.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/filter/filter.h"
 #include "common/type/json.h"
 #include "info/info.h"
+#include "info/infoArchive.h"
+#include "info/infoBackup.h"
+#include "info/manifest/manifest.h"
 #include "version.h"
 
 #include "harness/debug.h"
@@ -136,9 +140,13 @@ hrnInfoPut(const Storage *const storage, const char *const file, const char *con
 
     ASSERT(info != NULL);
 
-    // Default to the format a new repository is created at
+    // Default to the format a new repository is created at, or to format 7 for aes-256-gcm, which is only written at that format
     if (param.format == 0)
-        param.format = REPOSITORY_FORMAT_DEFAULT;
+    {
+        param.format =
+            param.cipherSpec != NULL && cipherSpecType(param.cipherSpec) == cipherTypeAes256Gcm ?
+                REPOSITORY_FORMAT_7 : REPOSITORY_FORMAT_DEFAULT;
+    }
 
     const Buffer *content = harnessInfoChecksumFormat(param.format, STR(info));
 
@@ -149,8 +157,39 @@ hrnInfoPut(const Storage *const storage, const char *const file, const char *con
         Buffer *const encrypted = bufNew(0);
         IoWrite *const write = ioBufferWriteNew(encrypted);
 
-        // If a file with a header
-        if (param.header)
+        // An aes-256-gcm file is bound to the identity its file name gives: an info file to its name, and a manifest in a backup
+        // path to its label and whether it is the final manifest or the in-progress copy
+        if (cipherSpecType(param.cipherSpec) == cipherTypeAes256Gcm)
+        {
+            const String *const fileName = STR(file);
+            const String *const baseName = strBase(fileName);
+
+            if (strEqZ(baseName, BACKUP_MANIFEST_FILE) || strEqZ(baseName, BACKUP_MANIFEST_FILE INFO_COPY_EXT))
+            {
+                StringList *const identity = strLstNew();
+
+                strLstAddZ(identity, "manifest");
+                strLstAdd(identity, strBase(strPath(fileName)));
+                strLstAddZ(identity, strEqZ(baseName, BACKUP_MANIFEST_FILE) ? "final" : "in-progress");
+
+                cipherFormatFilterGroupAdd(ioWriteFilterGroup(write), cipherModeEncrypt, param.cipherSpec, identity);
+            }
+            else
+            {
+                const char *infoName = NULL;
+
+                if (strstr(file, INFO_ARCHIVE_FILE) != NULL)
+                    infoName = INFO_ARCHIVE_FILE;
+                else if (strstr(file, INFO_BACKUP_FILE) != NULL)
+                    infoName = INFO_BACKUP_FILE;
+
+                CHECK(AssertError, infoName != NULL, "aes-256-gcm file must be an info file or a manifest");
+
+                cipherFormatInfoWriteAdd(encrypted, ioWriteFilterGroup(write), param.cipherSpec, param.format, infoName);
+            }
+        }
+        // Else if a file with a header
+        else if (param.header)
         {
             cipherBlockFormatFilterGroupWriteAdd(encrypted, ioWriteFilterGroup(write), param.cipherSpec, param.format);
         }

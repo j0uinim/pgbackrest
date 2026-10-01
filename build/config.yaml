@@ -1712,6 +1712,7 @@ option:
     allow-list:
       - 5
       - 6
+      - 7
     command:
       stanza-create: {}
       stanza-upgrade: {}
@@ -1726,6 +1727,7 @@ option:
     allow-list:
       - none
       - aes-256-cbc
+      - aes-256-gcm
     command: repo-type
     deprecate:
       repo-cipher-type: {}
@@ -1739,6 +1741,7 @@ option:
       option: repo-cipher-type
       list:
         - aes-256-cbc
+        - aes-256-gcm
     group: repo
     deprecate:
       repo-cipher-pass: {}

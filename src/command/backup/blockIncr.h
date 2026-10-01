@@ -12,6 +12,10 @@ in the super block. For large block sizes the block size will usually equal the 
 The super block list is followed by the block map, which is encrypted separately when required but not compressed. The return value
 of the filter is the stored block map size. Combined with the repo size this allows the block map to be read separately.
 
+When the repository is encrypted each super block and the block map are separate raw streams. With aes-256-gcm each is bound to its
+own identity, built from the label of the backup and the manifest name of the file (see backupSuperBlockCipherIdentity() and
+backupBlockMapCipherIdentity()), so both are required.
+
 The map is duplicated in each backup where the file has changed so the block map only needs to be retrieved from the most recent
 backup. However, the block map may reference super block lists (or parts thereof) in any prior (or the current) backup.
 
@@ -28,6 +32,7 @@ SHA1 file checksum. This will fail the backup, which is not ideal, but better th
 #ifndef COMMAND_BACKUP_BLOCK_INCR_H
 #define COMMAND_BACKUP_BLOCK_INCR_H
 
+#include "common/crypto/spec.h"
 #include "common/io/filter/filter.h"
 
 /***********************************************************************************************************************************
@@ -40,7 +45,8 @@ Constructors
 ***********************************************************************************************************************************/
 FN_EXTERN IoFilter *blockIncrNew(
     uint64_t superBlockSize, size_t blockSize, size_t checksumSize, unsigned int reference, uint64_t bundleId,
-    uint64_t bundleOffset, const Buffer *blockMapPrior, const IoFilter *compress, const IoFilter *encrypt);
+    uint64_t bundleOffset, const Buffer *blockMapPrior, const IoFilter *compress, const CipherSpec *cipherSpec,
+    const String *backupLabel, const String *manifestName);
 FN_EXTERN IoFilter *blockIncrNewPack(const Pack *paramList);
 
 #endif

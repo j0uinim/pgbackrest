@@ -217,7 +217,8 @@ backupResumeFind(const Manifest *const manifest, const CipherSpec *const cipherS
                         {
                             TRY_BEGIN()
                             {
-                                manifestResume = manifestLoadFile(storageRepo(), manifestFile, cipherSpecManifest);
+                                manifestResume = manifestLoadFileP(
+                                    storageRepo(), manifestFile, cipherSpecManifest, .inProgress = true);
                             }
                             CATCH_ANY()
                             {

@@ -465,5 +465,22 @@ testRun(void)
         TEST_RESULT_STRLST_Z(strLstSort(list, sortOrderDesc), "11-10\n10-4\n9.6-1\n17-1\n", "sort descending");
     }
 
+    // *****************************************************************************************************************************
+    if (testBegin("archiveCipherIdentity()"))
+    {
+        TEST_RESULT_STRLST_Z(
+            archiveCipherIdentity(STRDEF("18-1/000000010000000100000002-0123456789abcdef0123456789abcdef01234567.gz")),
+            "archive\n18-1/0000000100000001/000000010000000100000002-0123456789abcdef0123456789abcdef01234567.gz\n",
+            "segment without the WAL directory is bound as stored");
+        TEST_RESULT_STRLST_Z(
+            archiveCipherIdentity(
+                STRDEF("18-1/0000000100000001/000000010000000100000002-0123456789abcdef0123456789abcdef01234567")),
+            "archive\n18-1/0000000100000001/000000010000000100000002-0123456789abcdef0123456789abcdef01234567\n",
+            "segment with the WAL directory is bound as given");
+        TEST_RESULT_STRLST_Z(
+            archiveCipherIdentity(STRDEF("18-1/00000002.history")), "archive\n18-1/00000002.history\n",
+            "history file is stored at the archive id");
+    }
+
     FUNCTION_HARNESS_RETURN_VOID();
 }

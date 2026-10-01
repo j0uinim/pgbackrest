@@ -1436,9 +1436,14 @@
                             <allow-list caption="cipher types">
                                 <allow-item id="none">The repository is not encrypted</allow-item>
                                 <allow-item id="aes-256-cbc">Advanced Encryption Standard with 256 bit key length</allow-item>
+                                <allow-item id="aes-256-gcm">Authenticated encryption with Advanced Encryption Standard in Galois/Counter Mode with 256 bit key length, which detects a repository file that was modified, truncated, extended, or copied to another name</allow-item>
                             </allow-list>
 
                             <p>Note that encryption is always performed client-side even if the repository type (e.g. S3) supports encryption.</p>
+
+                            <p>The <id>aes-256-gcm</id> cipher type is the streaming authenticated encryption of Tink (AES-GCM-HKDF with 1 MiB segments), so a repository file can also be decrypted with Tink. It requires repository format 7 and <proper>OpenSSL</proper> 3.0.8 or later, and it is keyed with random bytes rather than with a passphrase, see <br-option>repo-cipher-pass</br-option>.</p>
+
+                            <p>Each file is bound to the stanza and to its place in the repository, e.g. the name of a WAL segment or the label of a backup and the name of a file in it, so a file copied to another place does not decrypt. A file replaced by an earlier version of itself at the same place is not detected.</p>
                         </text>
 
                         <default>none</default>
@@ -1450,6 +1455,8 @@
 
                         <text>
                             <p>Passphrase used to encrypt/decrypt files of the repository.</p>
+
+                            <p>With the <id>aes-256-gcm</id> cipher type this is a key rather than a passphrase: the base64 of exactly 32 random bytes, e.g. generated with <code>openssl rand -base64 32</code>. Anything else is an error, so that a passphrase cannot be used as a key by mistake. The bytes must come from a cryptographically secure random generator and never from a password or anything typed or derived, since a weak key in the right form cannot be detected. Each repository must have its own key, since the key is what identifies the repository.</p>
 
                             <admonition type="note">When run without the <br-option>stanza</br-option> option the <cmd>info</cmd> command reads encryption settings only from the <setting>global</setting> section. If encryption settings are configured per stanza, run the <cmd>info</cmd> command with the <br-option>stanza</br-option> option to read an encrypted stanza.</admonition>
                         </text>
@@ -2472,6 +2479,8 @@
 
                     <p>If the repository is encrypted then <cmd>repo-get</cmd> will automatically decrypt the file. Files are not automatically decompressed but the output can be piped through the appropriate decompression command, e.g. <id>gzip -d</id>.</p>
 
+                    <p>With the <id>aes-256-gcm</id> cipher type each file is authenticated as it is decrypted, against an identity worked out from the path, so the path must name the file where it is stored, e.g. a backup by its label rather than through the <path>latest</path> link. A bundle or a block incremental file holds more than one encrypted stream and cannot be fetched with <cmd>repo-get</cmd>. The output is written as it is authenticated, so the output of a <cmd>repo-get</cmd> that fails must not be used.</p>
+
                     <p>If more than one repository is configured, the command will default to the highest priority repository (e.g. <id>repo1</id>) unless the <br-option>{[dash]}-repo</br-option> option is specified.</p>
                 </text>
 
@@ -2964,6 +2973,7 @@
                             <allow-list caption="formats">
                                 <allow-item id="5">Format supported by all versions since <proper>1.00</proper></allow-item>
                                 <allow-item id="6">Derives new repository encryption keys with <id>SHA-256</id> rather than <id>SHA-1</id></allow-item>
+                                <allow-item id="7">Authenticated encryption with the <id>aes-256-gcm</id> cipher type, which a repository at this format requires</allow-item>
                             </allow-list>
 
                             <p>An existing stanza is migrated to a newer format with the <cmd>stanza-upgrade</cmd> command rather than with this command, which sets the format only for a stanza it creates.</p>

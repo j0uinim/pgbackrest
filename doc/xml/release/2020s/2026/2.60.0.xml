@@ -20,6 +20,14 @@
 
                 <p>Add <br-option>checksum-page-error</br-option> option to error on invalid page checksums.</p>
             </release-item>
+
+            <release-item>
+                <release-item-contributor-list>
+                    <release-item-contributor id="j0uinim"/>
+                </release-item-contributor-list>
+
+                <p>Add <id>aes-256-gcm</id> authenticated repository cipher type.</p>
+            </release-item>
         </release-feature-list>
 
         <release-improvement-list>

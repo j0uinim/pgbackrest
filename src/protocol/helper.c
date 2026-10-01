@@ -835,6 +835,20 @@ protocolRemoteGet(const ProtocolStorageType protocolStorageType, const unsigned 
 
                 const VariantList *const optionList = configOptionRemote(protocolHelperClient->client, param);
 
+                // Check the options as they would have been checked at load had they been configured locally, before they are set.
+                // When they are refused the remote is freed so that it is fetched and checked again if it is asked for again.
+                TRY_BEGIN()
+                {
+                    cfgLoadRepoCipher(
+                        hostIdx, (CipherType)varUInt64(varLstGet(optionList, 0)), varStr(varLstGet(optionList, 1)));
+                }
+                CATCH_ANY()
+                {
+                    protocolHelperFree(protocolHelperClient->client);
+                    RETHROW();
+                }
+                TRY_END();
+
                 if (varUInt64(varLstGet(optionList, 0)) != cipherTypeNone)
                 {
                     cfgOptionIdxSet(cfgOptRepoCipherType, hostIdx, cfgSourceConfig, varLstGet(optionList, 0));

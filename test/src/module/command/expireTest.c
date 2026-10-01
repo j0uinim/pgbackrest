@@ -6,6 +6,7 @@ NOTE: references to 9.4 are intentionally included in this test to ensure that e
 #include <unistd.h>
 
 #include "command/backup/common.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "storage/posix/storage.h"
 
@@ -13,6 +14,10 @@ NOTE: references to 9.4 are intentionally included in this test to ensure that e
 #include "harness/info.h"
 #include "harness/storage.h"
 #include "harness/time.h"
+
+/***********************************************************************************************************************************
+Keys for the aes-256-gcm repository
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Helper functions
@@ -3306,6 +3311,226 @@ testRun(void)
             "P00   INFO: repo1: 18-1 remove archive, start = 00000001000000000000000A, stop = 00000001000000000000000D");
 
         harnessLogLevelReset();
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("cmdExpire() with aes-256-gcm"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        StringList *argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "db");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawZ(argList, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdExpire, argList);
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("db"));
+        const CipherSpec *const cipherSpecGcmManifest = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_MANIFEST), .stanza = STRDEF("db"));
+
+        // Manifest of a full backup that is not in backup.info, used to add it back to backup.info
+        const char *const manifestGcm =
+            "[backup]\n"
+            "backup-archive-start=\"000000010000000000000005\"\n"
+            "backup-archive-stop=\"000000010000000000000005\"\n"
+            "backup-label=\"20200103-000000F\"\n"
+            "backup-timestamp-copy-start=1578009601\n"
+            "backup-timestamp-start=1578009600\n"
+            "backup-timestamp-stop=1578009602\n"
+            "backup-type=\"full\"\n"
+            "\n"
+            "[backup:db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[backup:option]\n"
+            "option-archive-check=true\n"
+            "option-archive-copy=false\n"
+            "option-compress=false\n"
+            "option-hardlink=false\n"
+            "option-online=true\n"
+            "\n"
+            "[backup:target]\n"
+            "pg_data={\"path\":\"/pg/base\",\"type\":\"path\"}\n"
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_BACKUP "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[target:file]\n"
+            "pg_data/PG_VERSION={\"checksum\":\"184473f470864e067ee3a22e64b47b0a1c356f29\",\"size\":4,\"timestamp\":1578009600}\n"
+            "\n"
+            "[target:file:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0600\"\n"
+            "user=\"user1\"\n"
+            "\n"
+            "[target:path]\n"
+            "pg_data={}\n"
+            "\n"
+            "[target:path:default]\n"
+            "group=\"group1\"\n"
+            "mode=\"0700\"\n"
+            "user=\"user1\"\n";
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("expire a full backup and its archive");
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_ARCHIVE_PATH_FILE,
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_ARCHIVE "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-id\":6846378200844646865,\"db-version\":\"12\"}\n",
+            .cipherSpec = cipherSpecGcm);
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_BACKUP_PATH_FILE,
+            "[backup:current]\n"
+            "20200101-000000F={"
+            "\"backrest-format\":5,\"backrest-version\":\"2.58.0dev\","
+            "\"backup-archive-start\":\"000000010000000000000001\",\"backup-archive-stop\":\"000000010000000000000001\","
+            "\"backup-info-repo-size\":2369186,\"backup-info-repo-size-delta\":2369186,"
+            "\"backup-info-size\":20162900,\"backup-info-size-delta\":20162900,"
+            "\"backup-timestamp-start\":1577836800,\"backup-timestamp-stop\":1577836802,\"backup-type\":\"full\","
+            "\"db-id\":1,\"option-archive-check\":true,\"option-archive-copy\":false,\"option-backup-standby\":false,"
+            "\"option-checksum-page\":true,\"option-compress\":false,\"option-hardlink\":false,\"option-online\":true}\n"
+            "20200102-000000F={"
+            "\"backrest-format\":5,\"backrest-version\":\"2.58.0dev\","
+            "\"backup-archive-start\":\"000000010000000000000003\",\"backup-archive-stop\":\"000000010000000000000003\","
+            "\"backup-info-repo-size\":2369186,\"backup-info-repo-size-delta\":2369186,"
+            "\"backup-info-size\":20162900,\"backup-info-size-delta\":20162900,"
+            "\"backup-timestamp-start\":1577923200,\"backup-timestamp-stop\":1577923202,\"backup-type\":\"full\","
+            "\"db-id\":1,\"option-archive-check\":true,\"option-archive-copy\":false,\"option-backup-standby\":false,"
+            "\"option-checksum-page\":true,\"option-compress\":false,\"option-hardlink\":false,\"option-online\":true}\n"
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_MANIFEST "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-catalog-version=201909212\n"
+            "db-control-version=1201\n"
+            "db-id=1\n"
+            "db-system-id=6846378200844646865\n"
+            "db-version=\"12\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-catalog-version\":201909212,\"db-control-version\":1201,\"db-system-id\":6846378200844646865"
+            ",\"db-version\":\"12\"}\n",
+            .cipherSpec = cipherSpecGcm);
+
+        // Only the presence of the manifests of the backups in backup.info is checked, so they are not loaded
+        HRN_STORAGE_PUT_EMPTY(storageRepoWrite(), STORAGE_REPO_BACKUP "/20200101-000000F/" BACKUP_MANIFEST_FILE);
+        HRN_STORAGE_PUT_EMPTY(storageRepoWrite(), STORAGE_REPO_BACKUP "/20200102-000000F/" BACKUP_MANIFEST_FILE);
+
+        // Expire only lists and removes WAL, so the segments do not need to be encrypted
+        archiveGenerate(storageRepoWrite(), STORAGE_REPO_ARCHIVE, 1, 5, "12-1", "0000000100000000");
+
+        harnessLogLevelSet(logLevelDetail);
+
+        TEST_RESULT_VOID(cmdExpire(), "expire");
+        TEST_STORAGE_LIST(
+            storageRepo(), STORAGE_REPO_BACKUP,
+            "20200102-000000F/\n"
+            "20200102-000000F/backup.manifest\n"
+            "backup.info\n"
+            "backup.info.copy\n",
+            .comment = "oldest full backup removed");
+        TEST_STORAGE_LIST(
+            storageRepo(), STORAGE_REPO_ARCHIVE "/12-1/0000000100000000", archiveExpectList(3, 5, "0000000100000000"),
+            .comment = "archive prior to 000000010000000000000003 removed");
+        TEST_RESULT_LOG(
+            "P00   INFO: repo1: expire full backup 20200101-000000F\n"
+            "P00   INFO: repo1: remove expired backup 20200101-000000F\n"
+            "P00 DETAIL: repo1: 12-1 archive retention on backup 20200102-000000F, start = 000000010000000000000003\n"
+            "P00   INFO: repo1: 12-1 remove archive, start = 000000010000000000000001, stop = 000000010000000000000002");
+
+        InfoBackup *infoBackup = NULL;
+
+        TEST_ASSIGN(infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup.info");
+        TEST_RESULT_STRLST_Z(infoBackupDataLabelList(infoBackup, NULL), "20200102-000000F\n", "backup removed from backup.info");
+        TEST_ASSIGN(
+            infoBackup, infoBackupLoadFile(storageRepo(), STRDEF(INFO_BACKUP_PATH_FILE INFO_COPY_EXT), cipherSpecGcm),
+            "load backup.info.copy");
+        TEST_RESULT_STRLST_Z(
+            infoBackupDataLabelList(infoBackup, NULL), "20200102-000000F\n", "backup removed from backup.info.copy");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("backup in the repository but not in backup.info is added back");
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20200103-000000F/" BACKUP_MANIFEST_FILE, manifestGcm,
+            .cipherSpec = cipherSpecGcmManifest);
+
+        TEST_RESULT_VOID(cmdExpire(), "expire");
+        TEST_STORAGE_LIST(
+            storageRepo(), STORAGE_REPO_BACKUP,
+            "20200103-000000F/\n"
+            "20200103-000000F/backup.manifest\n"
+            "backup.info\n"
+            "backup.info.copy\n",
+            .comment = "backup added back is retained, prior full backup removed");
+        TEST_STORAGE_LIST(
+            storageRepo(), STORAGE_REPO_ARCHIVE "/12-1/0000000100000000", archiveExpectList(5, 5, "0000000100000000"),
+            .comment = "archive prior to 000000010000000000000005 removed");
+        TEST_RESULT_LOG(
+            "P00   WARN: backup '20200103-000000F' found in repository added to backup.info\n"
+            "P00   INFO: repo1: expire full backup 20200102-000000F\n"
+            "P00   INFO: repo1: remove expired backup 20200102-000000F\n"
+            "P00 DETAIL: repo1: 12-1 archive retention on backup 20200103-000000F, start = 000000010000000000000005\n"
+            "P00   INFO: repo1: 12-1 remove archive, start = 000000010000000000000003, stop = 000000010000000000000004");
+
+        TEST_ASSIGN(infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup.info");
+        TEST_RESULT_STRLST_Z(infoBackupDataLabelList(infoBackup, NULL), "20200103-000000F\n", "backup added to backup.info");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("manifest of another backup is refused");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20200104-000000F/" BACKUP_MANIFEST_FILE,
+            storageGetP(storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20200103-000000F/" BACKUP_MANIFEST_FILE))),
+            .comment = "copy manifest of 20200103-000000F to 20200104-000000F");
+
+        // Set backup.info time to the past to detect whether it is rewritten
+        const time_t timeBackupInfo = time(NULL) - 10;
+        HRN_STORAGE_TIME(storageRepo(), INFO_BACKUP_PATH_FILE, timeBackupInfo);
+
+        TEST_ERROR(cmdExpire(), CommandError, CFGCMD_EXPIRE " command encountered 1 error(s), check the log file for details");
+        TEST_RESULT_LOG(
+            "P00  ERROR: [095]: repo1: unable to load backup manifest file '" TEST_PATH "/repo-enc/backup/db/20200104-000000F/"
+            BACKUP_MANIFEST_FILE "':\n"
+            "            CryptoError: cipher segment 0 failed authentication\n"
+            "            HINT: is or was the repo encrypted?");
+
+        TEST_RESULT_INT(
+            storageInfoP(storageRepo(), INFO_BACKUP_PATH_FILE_STR).timeModified, timeBackupInfo, "backup.info not rewritten");
+        TEST_ASSIGN(infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup.info");
+        TEST_RESULT_STRLST_Z(infoBackupDataLabelList(infoBackup, NULL), "20200103-000000F\n", "backup not added to backup.info");
+        TEST_STORAGE_LIST(
+            storageRepo(), STORAGE_REPO_BACKUP,
+            "20200103-000000F/\n"
+            "20200103-000000F/backup.manifest\n"
+            "20200104-000000F/\n"
+            "20200104-000000F/backup.manifest\n"
+            "backup.info\n"
+            "backup.info.copy\n",
+            .comment = "no backup removed");
+
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+        harnessLogLevelReset();
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

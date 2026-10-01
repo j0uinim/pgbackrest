@@ -360,15 +360,22 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: common/crypto
-    total: 4
+    total: 5
     feature: STORAGE
     harness:
-      name: storage
-      shim:
-        - storage/posix/storage
+      - filter
+      - name: storage
+        shim:
+          - storage/posix/storage
+      - name: crypto
+        shim:
+          - name: common/crypto/common
+            function:
+              - cryptoRandomBytes
 
     coverage:
       - common/crypto/cipherBlock
+      - common/crypto/cipherGcm
       - common/crypto/common
       - common/crypto/hash
       - common/crypto/md5.vendor: included
@@ -377,10 +384,12 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: common/format
-    total: 3
+    total: 5
 
     coverage:
       - common/format/cipherBlockFormat
+      - common/format/cipherFormat
+      - common/format/cipherGcmFormat
       - common/format/format
 
   # --------------------------------------------------------------------------------------------------------------------------------
@@ -761,7 +770,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/archive/common
-    total: 9
+    total: 10
 
     coverage:
       - command/archive/common
@@ -821,7 +830,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/expire
-    total: 11
+    total: 12
 
     coverage:
       - command/expire/expire
@@ -839,7 +848,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/info
-    total: 3
+    total: 4
 
     coverage:
       - command/info/info
@@ -849,7 +858,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/backup
-    total: 13
+    total: 14
     harness:
       - name: backup
         integration: false
@@ -889,7 +898,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/restore
-    total: 16
+    total: 18
 
     harness: restore
 
@@ -931,7 +940,7 @@ unit:
 
   # --------------------------------------------------------------------------------------------------------------------------------
   - name: command/verify
-    total: 14
+    total: 15
 
     coverage:
       - command/verify/file

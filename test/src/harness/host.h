@@ -49,7 +49,7 @@ typedef struct HrnHostTestDefine
     const char *repo;                                               // Host acting as repository
     bool tls;                                                       // Use TLS instead of SSH for remote protocol?
     const char *stg;                                                // Storage type
-    bool enc;                                                       // Encryption
+    const char *enc;                                                // Cipher type
     const char *cmp;                                                // Compression type
     unsigned int rt;                                                // Repository total
     bool bnd;                                                       // Bundling enabled?
@@ -434,9 +434,6 @@ hrnHostSqlCommit(HrnHost *const this)
 /***********************************************************************************************************************************
 Helper functions
 ***********************************************************************************************************************************/
-// Cipher Spec
-const CipherSpec *hrnHostCipherSpec(void);
-
 // Compress Type
 CompressType hrnHostCompressType(void);
 

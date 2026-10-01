@@ -7,9 +7,9 @@ Harness for Creating Test Backups
 
 #include "command/backup/backup.h"
 #include "common/compress/helper.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/crypto/common.h"
 #include "common/crypto/hash.h"
+#include "common/format/cipherFormat.h"
 #include "config/config.h"
 #include "info/infoArchive.h"
 #include "info/manifest/manifest.h"
@@ -231,18 +231,24 @@ hrnBackupPqScript(const unsigned int pgVersion, const time_t backupTimeStart, Hr
             {
                 MEM_CONTEXT_TEMP_BEGIN()
                 {
+                    const String *const walSegment = strLstGet(walSegmentList, walSegmentIdx);
+                    const String *const walFile = strNewFmt(
+                        "%s-%s%s", strZ(walSegment), strZ(walChecksum), strZ(compressExtStr(param.walCompressType)));
                     StorageWrite *write = storageNewWriteP(
-                        storageRepoWrite(),
-                        strNewFmt(
-                            STORAGE_REPO_ARCHIVE "/%s/%s-%s%s", strZ(archiveId), strZ(strLstGet(walSegmentList, walSegmentIdx)),
-                            strZ(walChecksum), strZ(compressExtStr(param.walCompressType))));
+                        storageRepoWrite(), strNewFmt(STORAGE_REPO_ARCHIVE "/%s/%s", strZ(archiveId), strZ(walFile)));
 
                     if (param.walCompressType != compressTypeNone)
                         ioFilterGroupAdd(ioWriteFilterGroup(storageWriteIo(write)), compressFilterP(param.walCompressType, 1));
 
-                    // Encrypt with the archive passphrase, which is what archive-push writes WAL with
-                    cipherBlockFilterGroupAdd(
-                        ioWriteFilterGroup(storageWriteIo(write)), cipherModeEncrypt, infoArchiveCipherSpec(infoArchive));
+                    // Encrypt with the archive passphrase, which is what archive-push writes WAL with. With aes-256-gcm the WAL is
+                    // bound to its name as stored, which includes the WAL directory. The identity is built here rather than by the
+                    // code under test so that a difference shows.
+                    StringList *const identity = strLstNew();
+                    strLstAddZ(identity, "archive");
+                    strLstAddFmt(identity, "%s/%.16s/%s", strZ(archiveId), strZ(walSegment), strZ(walFile));
+
+                    cipherFormatFilterGroupAdd(
+                        ioWriteFilterGroup(storageWriteIo(write)), cipherModeEncrypt, infoArchiveCipherSpec(infoArchive), identity);
 
                     storagePutP(write, walBuffer);
                 }

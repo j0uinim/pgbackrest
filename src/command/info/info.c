@@ -1464,6 +1464,9 @@ infoUpdateStanza(
     {
         volatile int stanzaStatus = INFO_STANZA_STATUS_CODE_OK;
 
+        // The streams of aes-256-gcm are bound to their stanza, which is not the stanza option when info reads every stanza
+        const CipherSpec *const cipherSpec = cipherSpecDupStanza(cfgCipherSpecMainIdx(repoIdx), stanzaRepo->name);
+
         TRY_BEGIN()
         {
             // If full output is requested read info and manifest files
@@ -1477,7 +1480,7 @@ infoUpdateStanza(
                     // Attempt to load the backup info file
                     stanzaRepo->repoList[repoIdx].backupInfo = infoBackupLoadFile(
                         storage, strNewFmt(STORAGE_PATH_BACKUP "/%s/%s", strZ(stanzaRepo->name), INFO_BACKUP_FILE),
-                        cfgCipherSpecMainIdx(repoIdx));
+                        cipherSpec);
                 }
                 CATCH(FileMissingError)
                 {
@@ -1501,12 +1504,12 @@ infoUpdateStanza(
                 {
                     stanzaRepo->repoList[repoIdx].archiveInfo = infoArchiveLoadFile(
                         storage, strNewFmt(STORAGE_PATH_ARCHIVE "/%s/%s", strZ(stanzaRepo->name), INFO_ARCHIVE_FILE),
-                        cfgCipherSpecMainIdx(repoIdx));
+                        cipherSpec);
 
                     // If a specific backup exists on this repo then attempt to load the manifest
                     if (backupLabel != NULL)
                     {
-                        stanzaRepo->repoList[repoIdx].manifest = manifestLoadFile(
+                        stanzaRepo->repoList[repoIdx].manifest = manifestLoadFileP(
                             storage, strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel)),
                             infoBackupCipherSpec(stanzaRepo->repoList[repoIdx].backupInfo));
                     }

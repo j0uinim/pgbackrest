@@ -4,12 +4,13 @@ Backup Protocol Handler
 #include <build.h>
 
 #include "command/backup/blockIncr.h"
+#include "command/backup/common.h"
 #include "command/backup/pageChecksum.h"
 #include "command/backup/protocol.h"
 #include "common/compress/helper.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/crypto/hash.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/filter/size.h"
@@ -116,6 +117,7 @@ backupFileProtocol(PackRead *const param)
         const CompressType repoFileCompressType = (CompressType)pckReadU32P(param);
         const int repoFileCompressLevel = pckReadI32P(param);
         const CipherSpec *const cipherSpecBackup = cipherSpecNewPack(param);
+        const String *const backupLabel = pckReadStrP(param);
         const PgPageSize pageSize = pckReadU32P(param);
         const String *const pgVersionForce = pckReadStrP(param);
 
@@ -145,6 +147,7 @@ backupFileProtocol(PackRead *const param)
                 {
                     file.blockIncrMapPriorOffset = pckReadU64P(param);
                     file.blockIncrMapPriorSize = pckReadU64P(param);
+                    file.blockIncrMapPriorLabel = pckReadStrP(param);
                 }
             }
 
@@ -162,8 +165,8 @@ backupFileProtocol(PackRead *const param)
 
         // Backup file
         const List *const resultList = backupFile(
-            repoFile, bundleId, bundleRaw, blockIncrReference, repoFileCompressType, repoFileCompressLevel, cipherSpecBackup,
-            pgVersionForce, pageSize, fileList);
+            repoFile, backupLabel, bundleId, bundleRaw, blockIncrReference, repoFileCompressType, repoFileCompressLevel,
+            cipherSpecBackup, pgVersionForce, pageSize, fileList);
 
         // Return result
         PackWrite *const data = protocolServerResultData(result);

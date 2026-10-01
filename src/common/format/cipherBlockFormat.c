@@ -112,6 +112,11 @@ cipherBlockFormatHeaderRead(const uint8_t *const header)
         // Error on a format this version cannot read before anything is decrypted
         repoFormatValidate(result);
 
+        // Format 7 is only written with the aes-256-gcm cipher, so a block cipher header at that format was not written by this
+        // version. The header is not trusted to choose the cipher, so this is an error rather than a switch to that cipher.
+        if (result >= REPOSITORY_FORMAT_7)
+            THROW_FMT(FormatError, "repository format %u is not written with the block cipher", result);
+
         // The format is one this version can read, so the reserved byte must be the value this version writes
         if (headerZ[CIPHER_BLOCK_FORMAT_HEADER_SIZE - 1] != CIPHER_BLOCK_FORMAT_RESERVED)
             THROW(FormatError, "invalid cipher header");
@@ -377,7 +382,7 @@ cipherBlockFormatFilterGroupWriteAdd(
     ASSERT(buffer != NULL);
     ASSERT(filterGroup != NULL);
     ASSERT(cipherSpec != NULL);
-    ASSERT(format >= REPOSITORY_FORMAT_MIN && format <= REPOSITORY_FORMAT_MAX);
+    ASSERT(format >= REPOSITORY_FORMAT_MIN && format < REPOSITORY_FORMAT_7);
 
     if (cipherSpecType(cipherSpec) != cipherTypeNone)
     {

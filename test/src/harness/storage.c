@@ -10,7 +10,9 @@ Storage Test Harness
 #include <utime.h>
 
 #include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/debug.h"
+#include "common/io/bufferWrite.h"
 #include "common/type/object.h"
 #include "common/type/param.h"
 #include "common/user.h"
@@ -385,17 +387,53 @@ hrnStoragePut(
     if (param.timeModified != 0)
         strCatFmt(filter, "%stime[%" PRIu64 "]", strEmpty(filter) ? "" : "/", (uint64_t)param.timeModified);
 
-    // Add compression filter
+    // An aes-256-gcm file is written the way the repository writes a standalone file: the format prefix, then the stream bound to
+    // the stanza and the identity given. The stream is made in memory since the prefix goes in front of it. The command code that
+    // reads the file back does not use this, so a file written here that the command cannot read shows a real difference.
+    const Buffer *content = buffer;
+    const bool gcm = param.cipherSpec != NULL && cipherSpecType(param.cipherSpec) == cipherTypeAes256Gcm;
+    Buffer *const stream = gcm ? bufNew(0) : NULL;
+    IoWrite *const streamWrite = gcm ? ioBufferWriteNew(stream) : NULL;
+
+    // Add compression filter, to the stream when there is one since compression comes before encryption
     if (param.compressType != compressTypeNone)
     {
         ASSERT(param.compressType == compressTypeGz || param.compressType == compressTypeBz2);
-        ioFilterGroupAdd(filterGroup, compressFilterP(param.compressType, 1));
+        ioFilterGroupAdd(gcm ? ioWriteFilterGroup(streamWrite) : filterGroup, compressFilterP(param.compressType, 1));
 
         strCatFmt(filter, "%scmp[%s]", strEmpty(filter) ? "" : "/", strZ(compressTypeStr(param.compressType)));
     }
 
+    if (gcm)
+    {
+        ASSERT(param.cipherIdentity != NULL);
+        ASSERT(cipherSpecStanza(param.cipherSpec) != NULL);
+
+        StringList *const fieldList = strLstDup(param.cipherIdentity);
+        strLstInsert(fieldList, 0, cipherSpecStanza(param.cipherSpec));
+
+        ioFilterGroupAdd(
+            ioWriteFilterGroup(streamWrite),
+            cipherGcmNew(
+                cipherModeEncrypt, cipherGcmKeyDecode(cipherSpecPass(param.cipherSpec)), cipherGcmAdNew(fieldList)));
+
+        ioWriteOpen(streamWrite);
+
+        if (buffer != NULL)
+            ioWrite(streamWrite, buffer);
+
+        ioWriteClose(streamWrite);
+
+        // The prefix is written out here rather than taken from the code under test so that a difference shows
+        Buffer *const object = bufNew(0);
+        bufCat(object, BUFSTRDEF("PGBR007G"));
+        bufCat(object, stream);
+        content = object;
+
+        strCatFmt(filter, "%senc[aes-256-gcm]", strEmpty(filter) ? "" : "/");
+    }
     // Add encrypted filter
-    if (param.cipherSpec != NULL && cipherSpecType(param.cipherSpec) != cipherTypeNone)
+    else if (param.cipherSpec != NULL && cipherSpecType(param.cipherSpec) != cipherTypeNone)
     {
         // A key with no digest of its own derives with SHA-1, the digest of format 5
         ioFilterGroupAdd(
@@ -410,7 +448,7 @@ hrnStoragePut(
     hrnTestResultComment(param.comment);
 
     // Put file
-    storagePutP(destination, buffer);
+    storagePutP(destination, content);
 
     hrnTestResultEnd();
 }

@@ -12,6 +12,9 @@ copied into the object, so the caller can release whatever it read the pass from
 
 An unset digest means the repository format of the file being read or written specifies it.
 
+The stanza is part of what a stream encrypted with aes-256-gcm is bound to, since the key is shared by every stanza of a repository.
+It is kept here because it goes everywhere the pass goes, and it is not used by the block cipher.
+
 There is no digest or pass when the type is none, and the pass is never logged.
 ***********************************************************************************************************************************/
 #ifndef COMMON_CRYPTO_SPEC_H
@@ -35,6 +38,7 @@ typedef struct CipherSpecNewParam
 {
     VAR_PARAM_HEADER;
     HashType digest;                                                // Digest to derive the key with, unset when specified by format
+    const String *stanza;                                           // Stanza the streams are bound to (aes-256-gcm)
 } CipherSpecNewParam;
 
 #define cipherSpecNewP(type, pass, ...)                                                                                            \
@@ -60,6 +64,7 @@ typedef struct CipherSpecPub
     CipherType type;                                                // Cipher type, none when not encrypted
     HashType digest;                                                // Digest the pass derives with, unset when specified by format
     const Buffer *pass;                                             // Passphrase text or key bytes
+    const String *stanza;                                           // Stanza the streams are bound to, when there is one
 } CipherSpecPub;
 
 // Cipher type
@@ -83,6 +88,13 @@ cipherSpecPass(const CipherSpec *const this)
     return THIS_PUB(CipherSpec)->pass;
 }
 
+// Stanza the streams are bound to
+FN_INLINE_ALWAYS const String *
+cipherSpecStanza(const CipherSpec *const this)
+{
+    return THIS_PUB(CipherSpec)->stanza;
+}
+
 /***********************************************************************************************************************************
 Functions
 ***********************************************************************************************************************************/
@@ -97,6 +109,14 @@ typedef struct CipherSpecDupParam
     cipherSpecDup(this, (CipherSpecDupParam){VAR_PARAM_INIT, __VA_ARGS__})
 
 FN_EXTERN CipherSpec *cipherSpecDup(const CipherSpec *this, CipherSpecDupParam param);
+
+// Duplicate for a stanza, i.e. with the streams bound to the stanza. A command that reads more than one stanza, or that is run
+// without the stanza option, needs this since the spec from the configuration has only the stanza of the option.
+FN_INLINE_ALWAYS CipherSpec *
+cipherSpecDupStanza(const CipherSpec *const this, const String *const stanza)
+{
+    return cipherSpecNewP(cipherSpecType(this), cipherSpecPass(this), .digest = cipherSpecDigest(this), .stanza = stanza);
+}
 
 // Write to a pack so it can be passed over a protocol
 FN_EXTERN void cipherSpecPack(PackWrite *packWrite, const CipherSpec *this);

@@ -57,7 +57,7 @@ cmdRestore(void)
         // Load manifest
         RestoreJobData jobData = {.repoIdx = backupData.repoIdx};
 
-        jobData.manifest = manifestLoadFile(
+        jobData.manifest = manifestLoadFileP(
             storageRepoIdx(backupData.repoIdx),
             strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupData.backupSet)), backupData.cipherSpecManifest);
 

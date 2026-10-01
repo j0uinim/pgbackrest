@@ -32,6 +32,7 @@ typedef struct BackupFile
     const String *blockIncrMapPriorFile;                            // File containing prior block incremental map (NULL if none)
     uint64_t blockIncrMapPriorOffset;                               // Offset of prior block incremental map
     uint64_t blockIncrMapPriorSize;                                 // Size of prior block incremental map
+    const String *blockIncrMapPriorLabel;                           // Label of the backup that wrote the prior map
     const String *manifestFile;                                     // Repo file
     const Buffer *repoFileChecksum;                                 // Expected repo file checksum
     uint64_t repoFileSize;                                          // Expected repo file size
@@ -59,8 +60,8 @@ typedef struct BackupFileResult
 static IoFilter *
 backupFileBlockIncr(
     const BackupFile *const file, const unsigned int blockIncrReference, const uint64_t bundleId, const uint64_t bundleOffset,
-    StorageReadMulti *const biMapRead, const CipherSpec *const cipherSpecBackup, const IoFilter *const compress,
-    const IoFilter *const encrypt)
+    StorageReadMulti *const biMapRead, const CipherSpec *const cipherSpecBackup, const String *const backupLabel,
+    const IoFilter *const compress)
 {
     FUNCTION_LOG_BEGIN(logLevelTrace);
         FUNCTION_LOG_PARAM_P(VOID, file);
@@ -69,8 +70,8 @@ backupFileBlockIncr(
         FUNCTION_LOG_PARAM(UINT64, bundleOffset);
         FUNCTION_LOG_PARAM(STORAGE_READ_MULTI, biMapRead);
         FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpecBackup);
+        FUNCTION_LOG_PARAM(STRING, backupLabel);
         FUNCTION_LOG_PARAM(IO_FILTER, compress);
-        FUNCTION_LOG_PARAM(IO_FILTER, encrypt);
     FUNCTION_LOG_END();
 
     ASSERT(file != NULL);
@@ -83,11 +84,16 @@ backupFileBlockIncr(
     {
         result = blockIncrNew(
             file->blockIncrSuperSize, file->blockIncrSize, file->blockIncrChecksumSize, blockIncrReference, bundleId, bundleOffset,
-            NULL, compress, encrypt);
+            NULL, compress, cipherSpecBackup, backupLabel, file->manifestFile);
     }
     // Else read the prior block map and create the filter with it
     else
     {
+        // The prior map is bound to the label of the backup that wrote it, which comes from a pack, so check it at run time
+        CHECK(
+            AssertError, cipherSpecType(cipherSpecBackup) == cipherTypeNone || file->blockIncrMapPriorLabel != NULL,
+            "prior block map label is required to decrypt");
+
         ASSERT(biMapRead != NULL);
 
         MEM_CONTEXT_TEMP_BEGIN()
@@ -103,8 +109,10 @@ backupFileBlockIncr(
                 if (cipherSpecType(cipherSpecBackup) != cipherTypeNone)
                 {
                     ioFilterGroupAdd(
-                        ioWriteFilterGroup(blockMapWrite), cipherBlockNewP(
-                            cipherModeDecrypt, cipherSpecBackup, .header = cipherBlockHeaderNone));
+                        ioWriteFilterGroup(blockMapWrite),
+                        cipherFormatNewP(
+                            cipherModeDecrypt, cipherSpecBackup,
+                            backupBlockMapCipherIdentity(file->blockIncrMapPriorLabel, file->manifestFile), .raw = true));
                 }
 
                 ioWriteOpen(blockMapWrite);
@@ -128,7 +136,7 @@ backupFileBlockIncr(
                 {
                     result = blockIncrNew(
                         file->blockIncrSuperSize, file->blockIncrSize, file->blockIncrChecksumSize, blockIncrReference, bundleId,
-                        bundleOffset, blockMap, compress, encrypt);
+                        bundleOffset, blockMap, compress, cipherSpecBackup, backupLabel, file->manifestFile);
                 }
                 MEM_CONTEXT_PRIOR_END();
             }
@@ -149,12 +157,14 @@ backupFileBlockIncr(
 
 static List *
 backupFile(
-    const String *const repoFile, const uint64_t bundleId, const bool bundleRaw, const unsigned int blockIncrReference,
-    const CompressType repoFileCompressType, const int repoFileCompressLevel, const CipherSpec *const cipherSpecBackup,
-    const String *const pgVersionForce, const PgPageSize pageSize, const List *const fileList)
+    const String *const repoFile, const String *const backupLabel, const uint64_t bundleId, const bool bundleRaw,
+    const unsigned int blockIncrReference, const CompressType repoFileCompressType, const int repoFileCompressLevel,
+    const CipherSpec *const cipherSpecBackup, const String *const pgVersionForce, const PgPageSize pageSize,
+    const List *const fileList)
 {
     FUNCTION_LOG_BEGIN(logLevelDebug);
         FUNCTION_LOG_PARAM(STRING, repoFile);                       // Repo file
+        FUNCTION_LOG_PARAM(STRING, backupLabel);                    // Label of the backup the files are written to
         FUNCTION_LOG_PARAM(UINT64, bundleId);                       // Bundle id (0 if none)
         FUNCTION_LOG_PARAM(BOOL, bundleRaw);                        // Raw compress/encrypt format in bundles?
         FUNCTION_LOG_PARAM(UINT, blockIncrReference);               // Block incremental reference to use in map
@@ -167,6 +177,7 @@ backupFile(
     FUNCTION_LOG_END();
 
     ASSERT(repoFile != NULL);
+    ASSERT(backupLabel != NULL);
     ASSERT(cipherSpecBackup != NULL);
     ASSERT(fileList != NULL && !lstEmpty(fileList));
     ASSERT(pgPageSizeValid(pageSize));
@@ -367,22 +378,15 @@ backupFile(
                                 repoFileCompressType, repoFileCompressLevel, .raw = bundleRaw || file->blockIncrSize != 0) :
                             NULL;
 
-                    // Encrypt filter
-                    IoFilter *const encrypt =
-                        cipherSpecType(cipherSpecBackup) != cipherTypeNone ?
-                            cipherBlockNewP(
-                                cipherModeEncrypt, cipherSpecBackup,
-                                .header = bundleRaw || file->blockIncrSize != 0 ? cipherBlockHeaderNone : cipherBlockHeaderMagic) :
-                            NULL;
-
-                    // If block incremental then add the filter and pass compress/encrypt filters to it since each block is
-                    // compressed/encrypted separately
+                    // If block incremental then add the filter and pass the compress filter and the cipher spec to it since each
+                    // super block is compressed/encrypted separately
                     if (file->blockIncrSize != 0)
                     {
                         ioFilterGroupAdd(
                             ioReadFilterGroup(readIo),
                             backupFileBlockIncr(
-                                file, blockIncrReference, bundleId, bundleOffset, biMapRead, cipherSpecBackup, compress, encrypt));
+                                file, blockIncrReference, bundleId, bundleOffset, biMapRead, cipherSpecBackup, backupLabel,
+                                compress));
 
                         repoChecksum = true;
                     }
@@ -397,9 +401,13 @@ backupFile(
                         }
 
                         // Add encrypt filter
-                        if (encrypt != NULL)
+                        if (cipherSpecType(cipherSpecBackup) != cipherTypeNone)
                         {
-                            ioFilterGroupAdd(ioReadFilterGroup(readIo), encrypt);
+                            ioFilterGroupAdd(
+                                ioReadFilterGroup(readIo),
+                                cipherFormatNewP(
+                                    cipherModeEncrypt, cipherSpecBackup, backupFileCipherIdentity(backupLabel, file->manifestFile),
+                                    .raw = bundleRaw));
                             repoChecksum = true;
                         }
                     }

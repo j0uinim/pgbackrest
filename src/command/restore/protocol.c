@@ -11,9 +11,9 @@ Restore Protocol Handler
 #include "command/restore/blockChecksum.h"
 #include "command/restore/blockDelta.h"
 #include "command/restore/protocol.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/crypto/hash.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/filter/size.h"
 #include "common/io/io.h"
 #include "common/io/limitRead.h"
@@ -47,6 +47,7 @@ restoreFileProtocol(PackRead *const param)
         const bool deltaForce = pckReadBoolP(param);
         const bool bundleRaw = pckReadBoolP(param);
         const CipherSpec *const cipherSpecBackup = cipherSpecNewPack(param);
+        const String *const backupLabel = pckReadStrP(param);
         const StringList *const referenceList = pckReadStrLstP(param);
 
         // Build the file list
@@ -85,8 +86,8 @@ restoreFileProtocol(PackRead *const param)
 
         // Restore files
         const List *const resultList = restoreFile(
-            repoFile, repoIdx, repoFileCompressType, copyTimeBegin, delta, deltaForce, bundleRaw, cipherSpecBackup, referenceList,
-            fileList);
+            repoFile, repoIdx, repoFileCompressType, copyTimeBegin, delta, deltaForce, bundleRaw, cipherSpecBackup, backupLabel,
+            referenceList, fileList);
 
         // Return result
         PackWrite *const data = protocolServerResultData(result);

@@ -8,6 +8,7 @@ Backup Command
 #include <time.h>
 #include <unistd.h>
 
+#include "command/archive/common.h"
 #include "command/archive/find.h"
 #include "command/backup/backup.h"
 #include "command/backup/common.h"
@@ -17,8 +18,8 @@ Backup Command
 #include "command/lock.h"
 #include "command/stanza/common.h"
 #include "common/compress/helper.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/filter/size.h"
 #include "common/log.h"
 #include "common/regExp.h"
@@ -241,7 +242,7 @@ cmdBackup(void)
 
         // Build an incremental backup if type is not full (manifestPrior will be freed in this call)
         if (!backupBuildIncr(manifest, manifestPrior, backupStartResult.walSegmentName))
-            manifestCipherSpecSet(manifest, cipherSpecGen(cfgOptionStrId(cfgOptRepoCipherType), manifestFormat(manifest)));
+            manifestCipherSpecSet(manifest, cipherSpecGen(cfgCipherSpecMain(), manifestFormat(manifest)));
 
         // Set delta if it is not already set and the manifest requires it
         if (!cfgOptionBool(cfgOptDelta) && varBool(manifestData(manifest)->backupOptionDelta))

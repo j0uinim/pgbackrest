@@ -7,8 +7,9 @@ Backup Manifest Handler
 #include <string.h>
 #include <time.h>
 
-#include "common/crypto/cipherBlock.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
+#include "common/format/format.h"
 #include "common/log.h"
 #include "common/regExp.h"
 #include "common/type/json.h"
@@ -112,7 +113,10 @@ manifestNewBuild(
         this->pub.data.backupOptionOnline = online;
         this->pub.data.backupOptionChecksumPage = varNewBool(checksumPage);
         this->pub.data.bundle = bundle;
-        this->pub.data.bundleRaw = blockIncr;
+
+        // Bundled files are raw with block incremental. They are raw at format 7 too: the manifest says what each bundled file is,
+        // so a format prefix in front of every file would only add to its size.
+        this->pub.data.bundleRaw = blockIncr || format >= REPOSITORY_FORMAT_7;
         this->pub.data.blockIncr = blockIncr;
 
         MEM_CONTEXT_TEMP_BEGIN()

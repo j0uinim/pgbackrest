@@ -302,6 +302,8 @@ Option value constants
 
 #define CFGOPTVAL_REPO_CIPHER_TYPE_AES_256_CBC                      STRID5("aes-256-cbc", 0xc43dfbbcdcca10)
 #define CFGOPTVAL_REPO_CIPHER_TYPE_AES_256_CBC_Z                    "aes-256-cbc"
+#define CFGOPTVAL_REPO_CIPHER_TYPE_AES_256_GCM                      STRID5("aes-256-gcm", 0x3467dfbbcdcca10)
+#define CFGOPTVAL_REPO_CIPHER_TYPE_AES_256_GCM_Z                    "aes-256-gcm"
 #define CFGOPTVAL_REPO_CIPHER_TYPE_NONE                             STRID5("none", 0x2b9ee0)
 #define CFGOPTVAL_REPO_CIPHER_TYPE_NONE_Z                           "none"
 

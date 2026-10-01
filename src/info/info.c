@@ -126,6 +126,7 @@ infoNew(const unsigned int format, const CipherSpec *const cipherSpecSub)
 #define INFO_SECTION_CIPHER                                         "cipher"
 #define INFO_KEY_CIPHER_DIGEST                                      "cipher-digest"
 #define INFO_KEY_CIPHER_PASS                                        "cipher-pass"
+#define INFO_KEY_CIPHER_TYPE                                        "cipher-type"
 
 FN_EXTERN Info *
 infoNewLoad(
@@ -155,6 +156,7 @@ infoNewLoad(
             IoFilter *const checksumActualFilter = cryptoHashNew(hashTypeSha1); // Checksum calculated from the file
             const String *checksumExpected = NULL;                              // Checksum found in ini file
             HashType cipherDigest = hashTypeSha1;                               // Digest the stored pass derives with
+            bool cipherTypeFound = false;                                       // Was the cipher type recorded?
 
             INFO_CHECKSUM_BEGIN(checksumActualFilter);
 
@@ -224,6 +226,21 @@ infoNewLoad(
                             {
                                 cipherDigest = jsonReadStrId(jsonReadNew(value->value));
                             }
+                            // The cipher is chosen from the configuration, never from the file, so the cipher recorded in the file
+                            // must be the one it was opened with. The record is inside the content the cipher authenticates.
+                            else if (strEqZ(value->key, INFO_KEY_CIPHER_TYPE))
+                            {
+                                const CipherType cipherType = (CipherType)jsonReadStrId(jsonReadNew(value->value));
+
+                                if (cipherType != cipherSpecType(cipherSpec))
+                                {
+                                    THROW_FMT(
+                                        CryptoError, "file cipher type '%s' does not match configured cipher type '%s'",
+                                        strZ(strNewStrId(cipherType)), strZ(strNewStrId(cipherSpecType(cipherSpec))));
+                                }
+
+                                cipherTypeFound = true;
+                            }
                             // No validation needed for cipher-pass, just store it
                             else if (strEqZ(value->key, INFO_KEY_CIPHER_PASS))
                             {
@@ -234,7 +251,7 @@ infoNewLoad(
                                     // and digest sorts before pass.
                                     this->pub.cipherSpec = cipherSpecNewP(
                                         cipherSpecType(cipherSpec), BUFSTR(varStr(jsonToVar(value->value))),
-                                        .digest = cipherDigest);
+                                        .digest = cipherDigest, .stanza = cipherSpecStanza(cipherSpec));
                                 }
                                 MEM_CONTEXT_OBJ_END();
                             }
@@ -275,6 +292,15 @@ infoNewLoad(
             // format is zero until the key is found and the value stored, so if we got here then the key was not found.
             if (infoFormat(this) == 0)
                 THROW(FormatError, "repository format not found\nHINT: is this a valid " PROJECT_NAME " info file?");
+
+            // Format 7 records the cipher it was written with, so a file at that format without the record is not one this version
+            // wrote
+            if (infoFormat(this) >= REPOSITORY_FORMAT_7 && !cipherTypeFound)
+                THROW(FormatError, "cipher type not found in repository format 7");
+
+            // Nor without the pass of its dependent files, which would otherwise be written without encryption
+            if (infoFormat(this) >= REPOSITORY_FORMAT_7 && this->pub.cipherSpec == NULL)
+                THROW(FormatError, "cipher pass not found in repository format 7");
 
             // Only a read that looked for a header reports a format, so a result here means the file had one. The header is written
             // from the same format as the content, so a file where they disagree has been damaged or put together from parts of two
@@ -428,7 +454,8 @@ infoSave(Info *const this, IoWrite *const write, InfoSaveCallback *const callbac
 
             // Store the digest the pass derives with so that a pass outlives the format of the file it is stored in. A pass in a
             // file written before this could be stored derives with SHA-1, which is what a reader assumes when it finds no digest.
-            if (infoFormat(this) >= REPOSITORY_FORMAT_6)
+            // Format 7 has no digest to store since the aes-256-gcm key is not derived from its pass.
+            if (infoFormat(this) == REPOSITORY_FORMAT_6)
             {
                 char digestZ[STRID_MAX + 1];
                 strIdToZ(cipherSpecDigest(infoCipherSpec(this)), digestZ);
@@ -439,6 +466,14 @@ infoSave(Info *const this, IoWrite *const write, InfoSaveCallback *const callbac
             infoSaveValue(
                 &data, INFO_SECTION_CIPHER, INFO_KEY_CIPHER_PASS,
                 jsonFromVar(VARSTR(strNewBuf(cipherSpecPass(infoCipherSpec(this))))));
+
+            // Record the cipher, which a reader checks against the cipher it was configured with
+            if (infoFormat(this) >= REPOSITORY_FORMAT_7)
+            {
+                infoSaveValue(
+                    &data, INFO_SECTION_CIPHER, INFO_KEY_CIPHER_TYPE,
+                    jsonFromVar(VARSTR(strNewStrId(cipherSpecType(infoCipherSpec(this))))));
+            }
         }
 
         // Flush out any additional sections

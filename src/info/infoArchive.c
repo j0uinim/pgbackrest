@@ -9,7 +9,7 @@ Archive Info Handler
 #include <string.h>
 
 #include "common/debug.h"
-#include "common/format/cipherBlockFormat.h"
+#include "common/format/cipherFormat.h"
 #include "common/ini.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/io.h"
@@ -252,7 +252,7 @@ infoArchiveLoadFileCallback(void *const data, const unsigned int try)
 
             // Attempt to load the file
             IoRead *const read = storageReadIo(storageNewReadP(loadData->storage, fileName));
-            cipherBlockFormatFilterGroupReadAdd(ioReadFilterGroup(read), loadData->cipherSpec);
+            cipherFormatInfoReadAdd(ioReadFilterGroup(read), loadData->cipherSpec, INFO_ARCHIVE_FILE);
 
             MEM_CONTEXT_BEGIN(loadData->memContext)
             {
@@ -339,7 +339,7 @@ infoArchiveSaveFile(
         // Write output into a buffer since it needs to be saved to storage twice
         Buffer *const buffer = bufNew(ioBufferSize());
         IoWrite *const write = ioBufferWriteNew(buffer);
-        cipherBlockFormatFilterGroupWriteAdd(buffer, ioWriteFilterGroup(write), cipherSpec, infoArchiveFormat(infoArchive));
+        cipherFormatInfoWriteAdd(buffer, ioWriteFilterGroup(write), cipherSpec, infoArchiveFormat(infoArchive), INFO_ARCHIVE_FILE);
         infoArchiveSave(infoArchive, write);
 
         // Save the file and make a copy

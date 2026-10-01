@@ -1008,12 +1008,43 @@ manifestSaveCallback(void *const callbackData, const String *const sectionNext, 
 }
 
 /**********************************************************************************************************************************/
+FN_EXTERN StringList *
+manifestCipherIdentity(const String *const fileName)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, fileName);
+    FUNCTION_TEST_END();
+
+    ASSERT(fileName != NULL);
+
+    StringList *const result = strLstNew();
+
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        const String *const name = strBase(fileName);
+        const bool final = strEqZ(name, BACKUP_MANIFEST_FILE);
+
+        CHECK_FMT(
+            AssertError, final || strEqZ(name, BACKUP_MANIFEST_FILE INFO_COPY_EXT), "'%s' is not a backup manifest",
+            strZ(fileName));
+
+        strLstAddZ(result, CIPHER_IDENTITY_MANIFEST);
+        strLstAdd(result, strBase(strPath(fileName)));
+        strLstAddZ(result, final ? CIPHER_IDENTITY_MANIFEST_FINAL : CIPHER_IDENTITY_MANIFEST_IN_PROGRESS);
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    FUNCTION_TEST_RETURN(STRING_LIST, result);
+}
+
+/**********************************************************************************************************************************/
 typedef struct ManifestLoadFileData
 {
     MemContext *memContext;                                         // Mem context
     const Storage *storage;                                         // Storage to load from
     const String *fileName;                                         // Base filename
     const CipherSpec *cipherSpec;                                   // Cipher spec
+    bool inProgress;                                                // Load the in-progress manifest
     Manifest *manifest;                                             // Loaded manifest object
 } ManifestLoadFileData;
 
@@ -1030,16 +1061,23 @@ manifestLoadFileCallback(void *const data, const unsigned int try)
     ManifestLoadFileData *const loadData = data;
     bool result = false;
 
-    if (try < 2)
+    // An aes-256-gcm manifest is loaded only from the file asked for, since the copy is the in-progress manifest. Else the copy is
+    // tried when the main file cannot be loaded.
+    const bool gcm = cipherSpecType(loadData->cipherSpec) == cipherTypeAes256Gcm;
+
+    if (try < (gcm ? 1 : 2))
     {
         MEM_CONTEXT_TEMP_BEGIN()
         {
             // Construct filename based on try
-            const String *const fileName = try == 0 ? loadData->fileName : strNewFmt("%s" INFO_COPY_EXT, strZ(loadData->fileName));
+            const String *const fileName =
+                (gcm ? loadData->inProgress : try == 1) ?
+                    strNewFmt("%s" INFO_COPY_EXT, strZ(loadData->fileName)) : loadData->fileName;
 
             // Attempt to load the file. A manifest has no header of its own, so it is decrypted with the spec as it was given.
             IoRead *const read = storageReadIo(storageNewReadP(loadData->storage, fileName));
-            cipherBlockFilterGroupAdd(ioReadFilterGroup(read), cipherModeDecrypt, loadData->cipherSpec);
+            cipherFormatFilterGroupAdd(
+                ioReadFilterGroup(read), cipherModeDecrypt, loadData->cipherSpec, manifestCipherIdentity(fileName));
 
             MEM_CONTEXT_BEGIN(loadData->memContext)
             {
@@ -1056,12 +1094,14 @@ manifestLoadFileCallback(void *const data, const unsigned int try)
 
 FN_EXTERN Manifest *
 manifestLoadFile(
-    const Storage *const storage, const String *const fileName, const CipherSpec *const cipherSpec)
+    const Storage *const storage, const String *const fileName, const CipherSpec *const cipherSpec,
+    const ManifestLoadFileParam param)
 {
     FUNCTION_LOG_BEGIN(logLevelDebug);
         FUNCTION_LOG_PARAM(STORAGE, storage);
         FUNCTION_LOG_PARAM(STRING, fileName);
         FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpec);
+        FUNCTION_LOG_PARAM(BOOL, param.inProgress);
     FUNCTION_LOG_END();
 
     ASSERT(storage != NULL);
@@ -1074,15 +1114,23 @@ manifestLoadFile(
         .storage = storage,
         .fileName = fileName,
         .cipherSpec = cipherSpec,
+        .inProgress = param.inProgress,
     };
 
     MEM_CONTEXT_TEMP_BEGIN()
     {
         const char *const fileNamePath = strZ(storagePathP(storage, fileName));
+        const String *error;
 
-        infoLoad(
-            strNewFmt("unable to load backup manifest file '%s' or '%s" INFO_COPY_EXT "'", fileNamePath, fileNamePath),
-            manifestLoadFileCallback, &data);
+        if (cipherSpecType(cipherSpec) != cipherTypeAes256Gcm)
+            error = strNewFmt("unable to load backup manifest file '%s' or '%s" INFO_COPY_EXT "'", fileNamePath, fileNamePath);
+        else
+        {
+            error = strNewFmt(
+                "unable to load backup manifest file '%s%s'", fileNamePath, param.inProgress ? INFO_COPY_EXT : "");
+        }
+
+        infoLoad(error, manifestLoadFileCallback, &data);
     }
     MEM_CONTEXT_TEMP_END();
 

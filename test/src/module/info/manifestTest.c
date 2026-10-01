@@ -3,11 +3,14 @@ Test Backup Manifest Handler
 ***********************************************************************************************************************************/
 #include <unistd.h>
 
+#include "common/crypto/cipherBlock.h"
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "info/infoBackup.h"
 #include "storage/posix/storage.h"
 
+#include "harness/config.h"
 #include "harness/info.h"
 #include "harness/manifest.h"
 #include "harness/postgres.h"
@@ -16,6 +19,59 @@ Test Backup Manifest Handler
 Special string constants
 ***********************************************************************************************************************************/
 // Shrug emoji as \xNN escapes to preserve 7-bit ASCII; runtime bytes are two U+00AF and a U+30C4 katakana tu around ASCII \_(...)_/
+// An aes-256-gcm key, a subpass for the files of a backup, and a manifest that records it
+#define TEST_GCM_LABEL                                              "20190808-163540F"
+#define TEST_GCM_LABEL_OTHER                                        "20190809-163540F"
+
+#define TEST_MANIFEST_GCM_HEAD                                                                                                     \
+    "[backup]\n"                                                                                                                   \
+    "backup-label=\"" TEST_GCM_LABEL "\"\n"                                                                                        \
+    "backup-timestamp-copy-start=1565282141\n"                                                                                     \
+    "backup-timestamp-start=1565282140\n"                                                                                          \
+    "backup-timestamp-stop=1565282142\n"                                                                                           \
+    "backup-type=\"full\"\n"                                                                                                       \
+    "\n"                                                                                                                           \
+    "[backup:db]\n"                                                                                                                \
+    "db-catalog-version=201608131\n"                                                                                               \
+    "db-control-version=960\n"                                                                                                     \
+    "db-id=1\n"                                                                                                                    \
+    "db-system-id=1000000000000000094\n"                                                                                           \
+    "db-version=\"9.6\"\n"                                                                                                         \
+    "\n"                                                                                                                           \
+    "[backup:option]\n"                                                                                                            \
+    "option-archive-check=true\n"                                                                                                  \
+    "option-archive-copy=true\n"                                                                                                   \
+    "option-compress=false\n"                                                                                                      \
+    "option-hardlink=false\n"                                                                                                      \
+    "option-online=false\n"                                                                                                        \
+    "\n"                                                                                                                           \
+    "[backup:target]\n"                                                                                                            \
+    "pg_data={\"path\":\"/pg/base\",\"type\":\"path\"}\n"                                                                          \
+    "\n"                                                                                                                           \
+    "[cipher]\n"                                                                                                                   \
+    "cipher-pass=\"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=\"\n"                                                               \
+    "cipher-type=\"aes-256-gcm\"\n"                                                                                                \
+    "\n"                                                                                                                           \
+    "[target:file]\n"                                                                                                              \
+    "pg_data/PG_VERSION={\"checksum\":\"184473f470864e067ee3a22e64b47b0a1c356f29\",\"size\":4,\"timestamp\":1565282114}\n"
+
+#define TEST_MANIFEST_GCM_TAIL                                                                                                     \
+    "\n"                                                                                                                           \
+    "[target:file:default]\n"                                                                                                      \
+    "group=\"group1\"\n"                                                                                                           \
+    "mode=\"0600\"\n"                                                                                                              \
+    "user=\"user1\"\n"                                                                                                             \
+    "\n"                                                                                                                           \
+    "[target:path]\n"                                                                                                              \
+    "pg_data={}\n"                                                                                                                 \
+    "\n"                                                                                                                           \
+    "[target:path:default]\n"                                                                                                      \
+    "group=\"group1\"\n"                                                                                                           \
+    "mode=\"0700\"\n"                                                                                                              \
+    "user=\"user1\"\n"
+
+#define TEST_MANIFEST_GCM                                           TEST_MANIFEST_GCM_HEAD TEST_MANIFEST_GCM_TAIL
+
 #define SHRUG_EMOJI                                                 "\xc2\xaf\\_(\xe3\x83\x84)_/\xc2\xaf"
 
 /***********************************************************************************************************************************
@@ -317,6 +373,8 @@ testRun(void)
                 storagePg, PG_VERSION_96, hrnPgCatalogVersion(PG_VERSION_96), REPOSITORY_FORMAT_DEFAULT, 1565282120, false, false,
                 false, false, NULL, NULL, pckWriteResult(tablespaceList)),
             "build manifest");
+        TEST_RESULT_BOOL(manifestData(manifest)->bundleRaw, false, "bundled files have a header below format 7");
+
         TEST_RESULT_VOID(manifestBackupLabelSet(manifest, STRDEF("20190818-084502F")), "backup label set");
 
         Buffer *contentSave = bufNew(0);
@@ -388,6 +446,14 @@ testRun(void)
         // Remove special file
         TEST_RESULT_VOID(
             storageRemoveP(storageTest, STRDEF(TEST_PATH "/pg/testpipe"), .errorOnMissing = true), "error if special file removed");
+
+        // Bundled files are raw at format 7 without block incremental
+        TEST_RESULT_BOOL(
+            manifestData(
+                manifestNewBuild(
+                    storagePg, PG_VERSION_96, hrnPgCatalogVersion(PG_VERSION_96), REPOSITORY_FORMAT_7, 1565282120, false, false,
+                    true, false, NULL, NULL, pckWriteResult(tablespaceList)))->bundleRaw,
+            true, "bundled files are raw at format 7");
 
         // Remove symlinks and directories
         THROW_ON_SYS_ERROR(unlink(TEST_PATH "/pg/pg_tblspc/1") == -1, FileRemoveError, "unable to remove symlink");
@@ -1585,7 +1651,7 @@ testRun(void)
                 ",\"rck\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reference\":\"20190818-084502F_20190819-084506D\""        \
                 ",\"size\":4,\"timestamp\":1565282114}\n"                                                                          \
             "pg_data/base/16384/17000={\"bi\":4,\"bni\":1,\"checksum\":\"e0101dd8ffb910c9c202ca35b5f828bcb9697bed\""               \
-                ",\"checksum-page\":false,\"checksum-page-error\":[1],\"repo-size\":4096,\"size\":8192,\"szo\":16384"             \
+                ",\"checksum-page\":false,\"checksum-page-error\":[1],\"repo-size\":4096,\"size\":8192,\"szo\":16384"              \
                 ",\"timestamp\":1565282114}\n"                                                                                     \
             "pg_data/base/16384/PG_VERSION={\"bni\":1,\"bno\":1,\"checksum\":\"184473f470864e067ee3a22e64b47b0a1c356f29\""         \
                 ",\"group\":\"group2\",\"size\":4,\"timestamp\":1565282115,\"user\":false}\n"                                      \
@@ -1982,12 +2048,12 @@ testRun(void)
     }
 
     // *****************************************************************************************************************************
-    if (testBegin("manifestLoadFile(), manifestFree()"))
+    if (testBegin("manifestLoadFileP(), manifestFree()"))
     {
         Manifest *manifest = NULL;
 
         TEST_ERROR(
-            manifestLoadFile(storageTest, BACKUP_MANIFEST_FILE_STR, cipherSpecNewNone()), FileMissingError,
+            manifestLoadFileP(storageTest, BACKUP_MANIFEST_FILE_STR, cipherSpecNewNone()), FileMissingError,
             "unable to load backup manifest file '" TEST_PATH "/backup.manifest' or '" TEST_PATH "/backup.manifest.copy':\n"
             "FileMissingError: unable to open missing file '" TEST_PATH "/backup.manifest' for read\n"
             "FileMissingError: unable to open missing file '" TEST_PATH "/backup.manifest.copy' for read");
@@ -2052,7 +2118,7 @@ testRun(void)
 
         HRN_INFO_PUT(storageTest, BACKUP_MANIFEST_FILE INFO_COPY_EXT, TEST_MANIFEST_CONTENT, .comment = "write manifest copy");
         TEST_ASSIGN(
-            manifest, manifestLoadFile(storageTest, STRDEF(BACKUP_MANIFEST_FILE), cipherSpecNewNone()),
+            manifest, manifestLoadFileP(storageTest, STRDEF(BACKUP_MANIFEST_FILE), cipherSpecNewNone()),
             "load copy");
         TEST_RESULT_UINT(manifestData(manifest)->pgSystemId, 1000000000000000094, "check file loaded");
         TEST_RESULT_STR_Z(manifestData(manifest)->backrestVersion, PROJECT_VERSION, "check backrest version");
@@ -2061,11 +2127,151 @@ testRun(void)
 
         HRN_INFO_PUT(storageTest, BACKUP_MANIFEST_FILE, TEST_MANIFEST_CONTENT, .comment = "write main manifest");
         TEST_ASSIGN(
-            manifest, manifestLoadFile(storageTest, STRDEF(BACKUP_MANIFEST_FILE), cipherSpecNewNone()),
+            manifest, manifestLoadFileP(storageTest, STRDEF(BACKUP_MANIFEST_FILE), cipherSpecNewNone()),
             "load main");
         TEST_RESULT_UINT(manifestData(manifest)->pgSystemId, 1000000000000000094, "check file loaded");
 
         TEST_RESULT_VOID(manifestFree(manifest), "free manifest");
         TEST_RESULT_VOID(manifestFree(NULL), "free null manifest");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - manifest bound to label and final or in progress");
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("demo"));
+
+        HRN_INFO_PUT(
+            storageTest, TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE, TEST_MANIFEST_GCM, .cipherSpec = cipherSpecGcm,
+            .comment = "write final manifest");
+
+        TEST_ASSIGN(
+            manifest, manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE), cipherSpecGcm),
+            "load final manifest");
+        TEST_RESULT_UINT(manifestData(manifest)->pgSystemId, 1000000000000000094, "check file loaded");
+        TEST_RESULT_UINT(cipherSpecType(manifestCipherSpec(manifest)), cipherTypeAes256Gcm, "subpass cipher");
+        TEST_RESULT_STR_Z(cipherSpecStanza(manifestCipherSpec(manifest)), "demo", "subpass bound to the stanza");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE), cipherSpecGcm, .inProgress = true),
+            FileMissingError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL "/backup.manifest.copy':\n"
+            "FileMissingError: unable to open missing file '" TEST_PATH "/" TEST_GCM_LABEL "/backup.manifest.copy' for read");
+
+        // The same bytes do not decrypt as the manifest of another backup
+        HRN_STORAGE_PUT(
+            storageTest, TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE,
+            storageGetP(storageNewReadP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE))),
+            .comment = "copy final manifest to another backup");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE), cipherSpecGcm), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL_OTHER "/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?");
+
+        // The in-progress manifest is loaded only when asked for, never in place of the final manifest
+        HRN_STORAGE_REMOVE(storageTest, TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE, .errorOnMissing = true);
+        HRN_INFO_PUT(
+            storageTest, TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, TEST_MANIFEST_GCM,
+            .cipherSpec = cipherSpecGcm, .comment = "write in-progress manifest");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE), cipherSpecGcm), FileMissingError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL_OTHER "/backup.manifest':\n"
+            "FileMissingError: unable to open missing file '" TEST_PATH "/" TEST_GCM_LABEL_OTHER "/backup.manifest' for read");
+
+        TEST_ASSIGN(
+            manifest,
+            manifestLoadFileP(
+                storageTest, STRDEF(TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE), cipherSpecGcm, .inProgress = true),
+            "load in-progress manifest");
+        TEST_RESULT_UINT(manifestData(manifest)->pgSystemId, 1000000000000000094, "check file loaded");
+
+        // The in-progress manifest does not decrypt as the final manifest
+        HRN_STORAGE_PUT(
+            storageTest, TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE,
+            storageGetP(storageNewReadP(storageTest, STRDEF(TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT))),
+            .comment = "copy in-progress manifest to final manifest");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL_OTHER "/" BACKUP_MANIFEST_FILE), cipherSpecGcm), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL_OTHER "/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - two-segment manifest fails on the second segment");
+
+        // A manifest with enough files to be stored as two cipher segments. The first is decrypted and parsed before the second is
+        // read, so a failure in the second comes after part of the manifest has been built.
+        String *const manifestLarge = strCatZ(strNew(), TEST_MANIFEST_GCM_HEAD);
+
+        for (unsigned int fileIdx = 0; fileIdx < 5000; fileIdx++)
+        {
+            strCatFmt(
+                manifestLarge,
+                "pg_data/file-with-a-name-long-enough-that-a-few-thousand-of-them-make-a-manifest-that-is-stored-as-more-than-one"
+                "-cipher-segment-%04u={\"checksum\":\"184473f470864e067ee3a22e64b47b0a1c356f29\",\"size\":4,"
+                "\"timestamp\":1565282114}\n",
+                fileIdx);
+        }
+
+        strCatZ(manifestLarge, TEST_MANIFEST_GCM_TAIL);
+
+        HRN_INFO_PUT(
+            storageTest, TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE, strZ(manifestLarge), .cipherSpec = cipherSpecGcm,
+            .comment = "write large manifest");
+
+        const Buffer *const manifestLargeStored = storageGetP(
+            storageNewReadP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE)));
+
+        TEST_RESULT_BOOL(
+            bufUsed(manifestLargeStored) > 8 + 1024 * 1024 && bufUsed(manifestLargeStored) < 8 + 2 * 1024 * 1024, true,
+            "stored as two cipher segments");
+
+        TEST_ASSIGN(
+            manifest, manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE), cipherSpecGcm),
+            "load large manifest");
+        TEST_RESULT_UINT(manifestFileTotal(manifest), 5001, "all files loaded");
+
+        // A bit flipped in the second cipher segment
+        Buffer *const manifestTamper = bufDup(manifestLargeStored);
+
+        bufPtr(manifestTamper)[bufUsed(manifestTamper) - 1] ^= 0x01;
+        HRN_STORAGE_PUT(
+            storageTest, TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE, manifestTamper,
+            .comment = "bit flipped in the second cipher segment");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE), cipherSpecGcm), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL "/backup.manifest':\n"
+            "CryptoError: cipher segment 1 failed authentication\n"
+            "HINT: is or was the repo encrypted?");
+
+        // Cut after the first cipher segment, which was not written as the last
+        HRN_STORAGE_PUT(
+            storageTest, TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE, BUF(bufPtrConst(manifestLargeStored), 8 + 1024 * 1024),
+            .comment = "cut after the first cipher segment");
+
+        TEST_ERROR(
+            manifestLoadFileP(storageTest, STRDEF(TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE), cipherSpecGcm), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/" TEST_GCM_LABEL "/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?");
+#endif
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("manifestCipherIdentity()");
+
+        TEST_RESULT_STRLST_Z(
+            manifestCipherIdentity(STRDEF("backup/demo/" TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE)),
+            "manifest\n" TEST_GCM_LABEL "\nfinal\n", "final manifest");
+        TEST_RESULT_STRLST_Z(
+            manifestCipherIdentity(STRDEF("backup/demo/" TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT)),
+            "manifest\n" TEST_GCM_LABEL "\nin-progress\n", "in-progress manifest");
+        TEST_ERROR(
+            manifestCipherIdentity(STRDEF("backup/demo/" TEST_GCM_LABEL "/bundle/1")), AssertError,
+            "'backup/demo/" TEST_GCM_LABEL "/bundle/1' is not a backup manifest");
     }
 }

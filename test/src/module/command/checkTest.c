@@ -1,7 +1,9 @@
 /***********************************************************************************************************************************
 Test Check Command
 ***********************************************************************************************************************************/
+
 #include "command/stanza/create.h"
+#include "common/crypto/cipherGcm.h"
 #include "info/infoArchive.h"
 #include "info/infoBackup.h"
 #include "postgres/version.h"
@@ -13,6 +15,10 @@ Test Check Command
 #include "harness/postgres.h"
 #include "harness/pq.h"
 #include "harness/storage.h"
+
+/***********************************************************************************************************************************
+Key for the aes-256-gcm repository
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test Run
@@ -540,6 +546,116 @@ testRun(void)
             "P00   INFO: check repo2 archive for WAL (primary)\n"
             "P00   INFO: WAL segment 000000010000000100000001 successfully archived to '" TEST_PATH "/repo2/archive/test1/15-1"
             "/0000000100000001/000000010000000100000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' on repo2");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - two stanzas in one repository checked without a stanza");
+
+        HRN_STORAGE_PUT_Z(
+            storageTest, "pgbackrest-gcm.conf",
+            "[global]\n"
+            "repo1-path=" TEST_PATH "/repo-enc\n"
+            "repo1-cipher-type=aes-256-gcm\n"
+            "repo1-cipher-pass=" TEST_CIPHER_KEY "\n"
+            "\n"
+            "[test1]\n"
+            "pg1-path=" TEST_PATH "/pg-gcm1\n"
+            "\n"
+            "[test2]\n"
+            "pg1-path=" TEST_PATH "/pg-gcm2\n");
+
+        // Create both stanzas, each with its own pg_control
+        for (unsigned int stanzaIdx = 1; stanzaIdx <= 2; stanzaIdx++)
+        {
+            StringList *const argListCreate = strLstNew();
+            hrnCfgArgRawZ(argListCreate, cfgOptConfig, TEST_PATH "/pgbackrest-gcm.conf");
+            hrnCfgArgRawFmt(argListCreate, cfgOptStanza, "test%u", stanzaIdx);
+            hrnCfgArgRawBool(argListCreate, cfgOptOnline, false);
+            HRN_CFG_LOAD(cfgCmdStanzaCreate, argListCreate);
+
+            HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_15);
+
+            TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+            TEST_RESULT_LOG_FMT("P00   INFO: stanza-create for stanza 'test%u' on repo1", stanzaIdx);
+
+            HRN_STORAGE_PUT_EMPTY(
+                storageTest,
+                zNewFmt(
+                    "repo-enc/archive/test%u/15-1/0000000100000001/000000010000000100000001-"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stanzaIdx));
+        }
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptConfig, TEST_PATH "/pgbackrest-gcm.conf");
+        hrnCfgArgRawZ(argList, cfgOptArchiveTimeout, "500ms");
+        HRN_CFG_LOAD(cfgCmdCheck, argList);
+
+        HRN_PQ_SCRIPT_SET(
+            HRN_PQ_SCRIPT_OPEN(1, "dbname='postgres' port=5432", PG_VERSION_15, TEST_PATH "/pg-gcm1", false, NULL, NULL),
+            HRN_PQ_SCRIPT_CREATE_RESTORE_POINT(1, "1/1"),
+            HRN_PQ_SCRIPT_WAL_SWITCH(1, "wal", "000000010000000100000001"),
+            HRN_PQ_SCRIPT_CLOSE(1),
+
+            HRN_PQ_SCRIPT_OPEN(1, "dbname='postgres' port=5432", PG_VERSION_15, TEST_PATH "/pg-gcm2", false, NULL, NULL),
+            HRN_PQ_SCRIPT_CREATE_RESTORE_POINT(1, "1/1"),
+            HRN_PQ_SCRIPT_WAL_SWITCH(1, "wal", "000000010000000100000001"),
+            HRN_PQ_SCRIPT_CLOSE(1));
+
+        TEST_RESULT_VOID(cmdCheck(), "check both stanzas");
+        TEST_RESULT_LOG(
+            "P00   INFO: check stanza 'test1'\n"
+            "P00   INFO: check repo1 configuration (primary)\n"
+            "P00   INFO: check repo1 archive for WAL (primary)\n"
+            "P00   INFO: WAL segment 000000010000000100000001 successfully archived to '" TEST_PATH "/repo-enc/archive/test1/15-1"
+            "/0000000100000001/000000010000000100000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' on repo1\n"
+            "P00   INFO: check stanza 'test2'\n"
+            "P00   INFO: check repo1 configuration (primary)\n"
+            "P00   INFO: check repo1 archive for WAL (primary)\n"
+            "P00   INFO: WAL segment 000000010000000100000001 successfully archived to '" TEST_PATH "/repo-enc/archive/test2/15-1"
+            "/0000000100000001/000000010000000100000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' on repo1");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - the info files of one stanza are refused in another");
+
+        HRN_STORAGE_PUT(
+            storageTest, "repo-enc/archive/test2/" INFO_ARCHIVE_FILE,
+            storageGetP(storageNewReadP(storageTest, STRDEF("repo-enc/archive/test1/" INFO_ARCHIVE_FILE))));
+        HRN_STORAGE_PUT(
+            storageTest, "repo-enc/archive/test2/" INFO_ARCHIVE_FILE INFO_COPY_EXT,
+            storageGetP(storageNewReadP(storageTest, STRDEF("repo-enc/archive/test1/" INFO_ARCHIVE_FILE INFO_COPY_EXT))));
+
+        HRN_CFG_LOAD(cfgCmdCheck, argList);
+
+        HRN_PQ_SCRIPT_SET(
+            HRN_PQ_SCRIPT_OPEN(1, "dbname='postgres' port=5432", PG_VERSION_15, TEST_PATH "/pg-gcm1", false, NULL, NULL),
+            HRN_PQ_SCRIPT_CREATE_RESTORE_POINT(1, "1/1"),
+            HRN_PQ_SCRIPT_WAL_SWITCH(1, "wal", "000000010000000100000001"),
+            HRN_PQ_SCRIPT_CLOSE(1),
+
+            HRN_PQ_SCRIPT_OPEN(1, "dbname='postgres' port=5432", PG_VERSION_15, TEST_PATH "/pg-gcm2", false, NULL, NULL),
+            HRN_PQ_SCRIPT_CLOSE(1));
+
+        TEST_ERROR(
+            cmdCheck(), CryptoError,
+            "unable to load info file '" TEST_PATH "/repo-enc/archive/test2/archive.info' or"
+            " '" TEST_PATH "/repo-enc/archive/test2/archive.info.copy':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?\n"
+            "HINT: archive.info cannot be opened but is required to push/get WAL segments.\n"
+            "HINT: is archive_command configured correctly in postgresql.conf?\n"
+            "HINT: has a stanza-create been performed?\n"
+            "HINT: use --no-archive-check to disable archive checks during backup if you have an alternate archiving scheme.");
+        TEST_RESULT_LOG(
+            "P00   INFO: check stanza 'test1'\n"
+            "P00   INFO: check repo1 configuration (primary)\n"
+            "P00   INFO: check repo1 archive for WAL (primary)\n"
+            "P00   INFO: WAL segment 000000010000000100000001 successfully archived to '" TEST_PATH "/repo-enc/archive/test1/15-1"
+            "/0000000100000001/000000010000000100000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' on repo1\n"
+            "P00   INFO: check stanza 'test2'\n"
+            "P00   INFO: check repo1 configuration (primary)");
+#endif
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("Primary == NULL (for test coverage)");

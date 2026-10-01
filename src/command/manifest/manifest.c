@@ -6,10 +6,11 @@ Manifest Command
 #include <unistd.h>
 
 #include "command/backup/blockMap.h"
+#include "command/backup/common.h"
 #include "command/manifest/manifest.h"
 #include "command/restore/blockChecksum.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/fdWrite.h"
 #include "common/io/io.h"
 #include "common/log.h"
@@ -222,12 +223,13 @@ cmdManifestBlockDeltaRender(const Manifest *const manifest, const ManifestFile *
         // Else render the block delta
         else
         {
+            // Label of the backup that wrote the file, which the block map is bound to
+            const String *const backupLabel = file->reference != NULL ? file->reference : manifestData(manifest)->backupLabel;
             StorageRead *const read = storageNewReadP(
                 storageRepo(),
                 backupFileRepoPathP(
-                    file->reference != NULL ? file->reference : manifestData(manifest)->backupLabel, .manifestName = file->name,
-                    .bundleId = file->bundleId, .compressType = manifestData(manifest)->backupOptionCompressType,
-                    .blockIncr = true),
+                    backupLabel, .manifestName = file->name, .bundleId = file->bundleId,
+                    .compressType = manifestData(manifest)->backupOptionCompressType, .blockIncr = true),
                 .offset = file->bundleOffset + file->sizeRepo - file->blockIncrMapSize,
                 .limit = VARUINT64(file->blockIncrMapSize));
 
@@ -235,7 +237,9 @@ cmdManifestBlockDeltaRender(const Manifest *const manifest, const ManifestFile *
             {
                 ioFilterGroupAdd(
                     ioReadFilterGroup(storageReadIo(read)),
-                    cipherBlockNewP(cipherModeDecrypt, manifestCipherSpec(manifest), .header = cipherBlockHeaderNone));
+                    cipherFormatNewP(
+                        cipherModeDecrypt, manifestCipherSpec(manifest), backupBlockMapCipherIdentity(backupLabel, file->name),
+                        .raw = true));
             }
 
             ioReadOpen(storageReadIo(read));
@@ -443,9 +447,21 @@ cmdManifestRender(void)
         // Load backup.info and cipher
         const InfoBackup *const infoBackup = infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain());
 
+        // An aes-256-gcm manifest is bound to the label of its backup, so the latest backup is loaded under its label, i.e. the
+        // newest in backup.info as restore finds it, rather than through the latest link
+        const String *backupLabel = cfgOptionStr(cfgOptSet);
+
+        if (cipherSpecType(cfgCipherSpecMain()) == cipherTypeAes256Gcm && strEqZ(backupLabel, BACKUP_LINK_LATEST))
+        {
+            if (infoBackupDataTotal(infoBackup) == 0)
+                THROW(BackupSetInvalidError, "no backup sets to show");
+
+            backupLabel = infoBackupData(infoBackup, infoBackupDataTotal(infoBackup) - 1).backupLabel;
+        }
+
         // Load manifest
-        const Manifest *const manifest = manifestLoadFile(
-            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(cfgOptionStr(cfgOptSet))),
+        const Manifest *const manifest = manifestLoadFileP(
+            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel)),
             infoBackupCipherSpec(infoBackup));
 
         // Manifest info

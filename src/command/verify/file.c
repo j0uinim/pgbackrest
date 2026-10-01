@@ -4,9 +4,9 @@ Verify File
 #include <build.h>
 
 #include "command/verify/file.h"
-#include "common/crypto/cipherBlock.h"
 #include "common/crypto/hash.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/filter/group.h"
 #include "common/io/filter/sink.h"
 #include "common/io/filter/size.h"
@@ -18,7 +18,8 @@ Verify File
 FN_EXTERN VerifyResult
 verifyFile(
     const String *const filePathName, const uint64_t offset, const Variant *const limit, const CompressType compressType,
-    const Buffer *const fileChecksum, const uint64_t fileSize, const CipherSpec *const cipherSpec)
+    const Buffer *const fileChecksum, const uint64_t fileSize, const CipherSpec *const cipherSpec,
+    const StringList *const cipherIdentity)
 {
     FUNCTION_LOG_BEGIN(logLevelDebug);
         FUNCTION_LOG_PARAM(STRING, filePathName);                   // Fully qualified file name
@@ -28,6 +29,7 @@ verifyFile(
         FUNCTION_LOG_PARAM(BUFFER, fileChecksum);                   // Checksum for the file
         FUNCTION_LOG_PARAM(UINT64, fileSize);                       // Size of file
         FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpec);                // Cipher spec to access the repo file if encrypted
+        FUNCTION_LOG_PARAM(STRING_LIST, cipherIdentity);            // Identity the repo file is bound to if encrypted
     FUNCTION_LOG_END();
 
     ASSERT(filePathName != NULL);
@@ -45,8 +47,7 @@ verifyFile(
         IoFilterGroup *const filterGroup = ioReadFilterGroup(read);
 
         // Add decryption filter
-        if (cipherSpecType(cipherSpec) != cipherTypeNone)
-            ioFilterGroupAdd(filterGroup, cipherBlockNewP(cipherModeDecrypt, cipherSpec));
+        cipherFormatFilterGroupAdd(filterGroup, cipherModeDecrypt, cipherSpec, cipherIdentity);
 
         // Add decompression filter
         if (compressType != compressTypeNone)

@@ -10,6 +10,7 @@ Host Harness
 #include "common/type/json.h"
 #include "common/wait.h"
 #include "config/config.h"
+#include "harness/config.h"
 #include "harness/exec.h"
 #include "postgres/interface.h"
 #include "postgres/version.h"
@@ -67,7 +68,7 @@ Constants
 #define HRN_HOST_TLS_SERVER_CERT                                    HRN_HOST_TLS_CERT_PATH "/pgbackrest-test-server.crt"
 #define HRN_HOST_TLS_SERVER_KEY                                     HRN_HOST_TLS_CERT_PATH "/pgbackrest-test-server.key"
 
-// Cipher passphrase
+// Cipher passphrase, and the key that aes-256-gcm requires in its place
 #define HRN_CIPHER_PASSPHRASE                                       "x"
 
 /***********************************************************************************************************************************
@@ -1033,13 +1034,6 @@ hrnHostGet(const StringId id)
 }
 
 /**********************************************************************************************************************************/
-const CipherSpec *
-hrnHostCipherSpec(void)
-{
-    FUNCTION_HARNESS_VOID();
-    FUNCTION_HARNESS_RETURN(CIPHER_SPEC, hrnHostLocal.cipherSpecMain);
-}
-
 CompressType
 hrnHostCompressType(void)
 {
@@ -1231,8 +1225,15 @@ hrnHostBuild(const int line, const HrnHostTestDefine *const testMatrix, const si
         hrnHostLocal.repoHost = strIdFromZ(testDef->repo);
         hrnHostLocal.storage = strIdFromZ(testDef->stg);
         hrnHostLocal.compressType = compressTypeEnum(strIdFromZ(testDef->cmp));
+
+        // An aes-256-gcm repository is keyed with random bytes rather than a passphrase
+        const CipherType cipherType = (CipherType)strIdFromZ(testDef->enc);
+        const char *const cipherPass = cipherType == cipherTypeAes256Gcm ? TEST_CIPHER_KEY : HRN_CIPHER_PASSPHRASE;
+
         hrnHostLocal.cipherSpecMain =
-            testDef->enc ? cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRZ(HRN_CIPHER_PASSPHRASE)) : cipherSpecNewNone();
+            cipherType == cipherTypeNone ?
+                cipherSpecNewNone() : cipherSpecNewP(cipherType, BUFSTRZ(cipherPass));
+
         hrnHostLocal.repoTotal = testDef->rt;
         hrnHostLocal.tls = testDef->tls;
         hrnHostLocal.bundle = testDef->bnd;
@@ -1245,7 +1246,7 @@ hrnHostBuild(const int line, const HrnHostTestDefine *const testMatrix, const si
     ASSERT(hrnHostLocal.repoHost == HRN_HOST_PG2 || hrnHostLocal.repoHost == HRN_HOST_REPO);
 
     TEST_RESULT_INFO_LINE_FMT(
-        line, "pg = %s, repo = %s, .tls = %d, stg = %s, enc = %d, cmp = %s, rt = %u, bnd = %d, bi = %d, nv = %d", testDef->pg,
+        line, "pg = %s, repo = %s, .tls = %d, stg = %s, enc = %s, cmp = %s, rt = %u, bnd = %d, bi = %d, nv = %d", testDef->pg,
         testDef->repo, testDef->tls, testDef->stg, testDef->enc, testDef->cmp, testDef->rt, testDef->bnd, testDef->bi,
         hrnHostLocal.nonVersionSpecific);
 

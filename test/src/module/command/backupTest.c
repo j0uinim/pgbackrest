@@ -1,8 +1,11 @@
 /***********************************************************************************************************************************
 Test Backup Command
 ***********************************************************************************************************************************/
+
 #include "command/stanza/create.h"
 #include "command/stanza/upgrade.h"
+#include "common/crypto/cipherGcm.h"
+#include "common/crypto/cipherGcm.intern.h"
 #include "common/crypto/hash.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
@@ -21,6 +24,56 @@ Test Backup Command
 #include "harness/protocol.h"
 #include "harness/storage.h"
 #include "harness/time.h"
+
+/***********************************************************************************************************************************
+An aes-256-gcm repository key, and a manifest at format 7 with a subpass for the files of the backup
+***********************************************************************************************************************************/
+#define TEST_GCM_LABEL                                              "20191003-105320F"
+
+#define TEST_MANIFEST_GCM                                                                                                          \
+    "[backup]\n"                                                                                                                   \
+    "backup-label=\"" TEST_GCM_LABEL "\"\n"                                                                                        \
+    "backup-timestamp-copy-start=1570000001\n"                                                                                     \
+    "backup-timestamp-start=1570000000\n"                                                                                          \
+    "backup-timestamp-stop=1570000002\n"                                                                                           \
+    "backup-type=\"full\"\n"                                                                                                       \
+    "\n"                                                                                                                           \
+    "[backup:db]\n"                                                                                                                \
+    "db-catalog-version=202506291\n"                                                                                               \
+    "db-control-version=1800\n"                                                                                                    \
+    "db-id=1\n"                                                                                                                    \
+    "db-system-id=10000000000000180000\n"                                                                                          \
+    "db-version=\"18\"\n"                                                                                                          \
+    "\n"                                                                                                                           \
+    "[backup:option]\n"                                                                                                            \
+    "option-archive-check=false\n"                                                                                                 \
+    "option-archive-copy=false\n"                                                                                                  \
+    "option-compress=false\n"                                                                                                      \
+    "option-hardlink=false\n"                                                                                                      \
+    "option-online=false\n"                                                                                                        \
+    "\n"                                                                                                                           \
+    "[backup:target]\n"                                                                                                            \
+    "pg_data={\"path\":\"/pg\",\"type\":\"path\"}\n"                                                                               \
+    "\n"                                                                                                                           \
+    "[cipher]\n"                                                                                                                   \
+    "cipher-pass=\"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=\"\n"                                                               \
+    "cipher-type=\"aes-256-gcm\"\n"                                                                                                \
+    "\n"                                                                                                                           \
+    "[target:file]\n"                                                                                                              \
+    "pg_data/PG_VERSION={\"checksum\":\"8dbabb96e032b8d9f1993c0e4b9141e71ade01a1\",\"size\":3,\"timestamp\":1570000000}\n"         \
+    "\n"                                                                                                                           \
+    "[target:file:default]\n"                                                                                                      \
+    "group=\"group1\"\n"                                                                                                           \
+    "mode=\"0600\"\n"                                                                                                              \
+    "user=\"user1\"\n"                                                                                                             \
+    "\n"                                                                                                                           \
+    "[target:path]\n"                                                                                                              \
+    "pg_data={}\n"                                                                                                                 \
+    "\n"                                                                                                                           \
+    "[target:path:default]\n"                                                                                                      \
+    "group=\"group1\"\n"                                                                                                           \
+    "mode=\"0700\"\n"                                                                                                              \
+    "user=\"user1\"\n"
 
 /***********************************************************************************************************************************
 Get a list of all files in the backup and a redacted version of the manifest that can be tested against a static string
@@ -93,8 +146,12 @@ testBackupValidateFile(
         if (cipherSpecType(cipherSpecBackup) != cipherTypeNone)
         {
             ioFilterGroupAdd(
-                ioReadFilterGroup(storageReadIo(read)), cipherBlockNewP(
-                    cipherModeDecrypt, cipherSpecBackup, .header = cipherBlockHeaderNone));
+                ioReadFilterGroup(storageReadIo(read)),
+                cipherFormatNewP(
+                    cipherModeDecrypt, cipherSpecBackup,
+                    backupBlockMapCipherIdentity(
+                        file.reference != NULL ? file.reference : manifestData->backupLabel, file.name),
+                    .raw = true));
         }
 
         ioReadOpen(storageReadIo(read));
@@ -130,8 +187,8 @@ testBackupValidateFile(
         bufUsedSet(fileBuffer, bufSize(fileBuffer));
 
         BlockDelta *const blockDelta = blockDeltaNew(
-            blockMap, file.blockIncrSize, file.blockIncrChecksumSize, NULL, cipherSpecBackup,
-            manifestData->backupOptionCompressType);
+            blockMap, file.blockIncrSize, file.blockIncrChecksumSize, NULL, cipherSpecBackup, manifestReferenceList(manifest),
+            file.name, manifestData->backupOptionCompressType);
 
         for (unsigned int readIdx = 0; readIdx < blockDeltaReadSize(blockDelta); readIdx++)
         {
@@ -174,8 +231,11 @@ testBackupValidateFile(
         if (cipherSpecType(cipherSpecBackup) != cipherTypeNone)
         {
             ioFilterGroupAdd(
-                ioReadFilterGroup(storageReadIo(read)), cipherBlockNewP(
-                    cipherModeDecrypt, cipherSpecBackup, .header = raw ? cipherBlockHeaderNone : cipherBlockHeaderMagic));
+                ioReadFilterGroup(storageReadIo(read)),
+                cipherFormatNewP(
+                    cipherModeDecrypt, cipherSpecBackup,
+                    backupFileCipherIdentity(file.reference != NULL ? file.reference : manifestData->backupLabel, file.name),
+                    .raw = raw));
         }
 
         if (manifestData->backupOptionCompressType != compressTypeNone)
@@ -424,7 +484,7 @@ testBackupValidate(const Storage *const storage, const String *const path, const
         // -------------------------------------------------------------------------------------------------------------------------
         const InfoBackup *const infoBackup = infoBackupLoadFile(
             storageRepo(), INFO_BACKUP_PATH_FILE_STR, param.cipherSpecMain == NULL ? cipherSpecNewNone() : param.cipherSpecMain);
-        Manifest *manifest = manifestLoadFile(
+        Manifest *manifest = manifestLoadFileP(
             storage, strNewFmt("%s/" BACKUP_MANIFEST_FILE, strZ(path)), infoBackupCipherSpec(infoBackup));
 
         // Build list of files in the manifest
@@ -571,6 +631,20 @@ testRun(void)
         const String *full = STRDEF("20181119-152138F");
         const String *incr = STRDEF("20181119-152138F_20181119-152152I");
         const String *diff = STRDEF("20181119-152138F_20181119-152152D");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm identities of what a backup writes");
+
+        TEST_RESULT_STRLST_Z(
+            backupFileCipherIdentity(full, STRDEF("pg_data/base/1/2")), "file\n" "20181119-152138F\n" "pg_data/base/1/2\n", "file");
+        TEST_RESULT_STRLST_Z(
+            backupSuperBlockCipherIdentity(diff, STRDEF("pg_data/base/1/2"), 131072),
+            "super-block\n" "20181119-152138F_20181119-152152D\n" "pg_data/base/1/2\n" "131072\n", "super block");
+        TEST_RESULT_STRLST_Z(
+            backupBlockMapCipherIdentity(incr, STRDEF("pg_data/base/1/2")),
+            "block-map\n" "20181119-152138F_20181119-152152I\n" "pg_data/base/1/2\n", "block map");
+        TEST_RESULT_STRLST_Z(
+            backupManifestHistoryCipherIdentity(full), "manifest-history\n" "20181119-152138F\n", "history manifest");
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("regular expression - error");
@@ -1136,7 +1210,9 @@ testRun(void)
         IoWrite *write = ioBufferWriteNew(destination);
 
         TEST_RESULT_VOID(
-            ioFilterGroupAdd(ioWriteFilterGroup(write), blockIncrNew(3, 3, 6, 0, 0, 0, NULL, NULL, NULL)), "block incr");
+            ioFilterGroupAdd(
+                ioWriteFilterGroup(write), blockIncrNew(3, 3, 6, 0, 0, 0, NULL, NULL, cipherSpecNewNone(), NULL, NULL)),
+            "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
         TEST_RESULT_VOID(ioWriteClose(write), "close");
@@ -1152,7 +1228,9 @@ testRun(void)
         write = ioBufferWriteNew(destination);
 
         TEST_RESULT_VOID(
-            ioFilterGroupAdd(ioWriteFilterGroup(write), blockIncrNew(3, 3, 8, 0, 0, 0, NULL, NULL, NULL)), "block incr");
+            ioFilterGroupAdd(
+                ioWriteFilterGroup(write), blockIncrNew(3, 3, 8, 0, 0, 0, NULL, NULL, cipherSpecNewNone(), NULL, NULL)),
+            "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
         TEST_RESULT_VOID(ioWriteClose(write), "close");
@@ -1187,7 +1265,7 @@ testRun(void)
         TEST_RESULT_VOID(
             ioFilterGroupAdd(
                 ioWriteFilterGroup(write),
-                blockIncrNewPack(ioFilterParamList(blockIncrNew(2, 3, 8, 2, 4, 5, NULL, NULL, NULL)))),
+                blockIncrNewPack(ioFilterParamList(blockIncrNew(2, 3, 8, 2, 4, 5, NULL, NULL, cipherSpecNewNone(), NULL, NULL)))),
             "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
@@ -1229,7 +1307,8 @@ testRun(void)
             ioFilterGroupAdd(ioWriteFilterGroup(write), ioBufferNew()), "buffer to force internal buffer size");
         TEST_RESULT_VOID(
             ioFilterGroupAdd(
-                ioWriteFilterGroup(write), blockIncrNewPack(ioFilterParamList(blockIncrNew(3, 3, 8, 3, 0, 0, map, NULL, NULL)))),
+                ioWriteFilterGroup(write),
+                blockIncrNewPack(ioFilterParamList(blockIncrNew(3, 3, 8, 3, 0, 0, map, NULL, cipherSpecNewNone(), NULL, NULL)))),
             "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
@@ -1273,7 +1352,8 @@ testRun(void)
             ioFilterGroupAdd(ioWriteFilterGroup(write), ioBufferNew()), "buffer to force internal buffer size");
         TEST_RESULT_VOID(
             ioFilterGroupAdd(
-                ioWriteFilterGroup(write), blockIncrNewPack(ioFilterParamList(blockIncrNew(3, 3, 8, 3, 0, 0, map, NULL, NULL)))),
+                ioWriteFilterGroup(write),
+                blockIncrNewPack(ioFilterParamList(blockIncrNew(3, 3, 8, 3, 0, 0, map, NULL, cipherSpecNewNone(), NULL, NULL)))),
             "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
@@ -1296,7 +1376,8 @@ testRun(void)
             ioFilterGroupAdd(ioWriteFilterGroup(write), ioBufferNew()), "buffer to force internal buffer size");
         TEST_RESULT_VOID(
             ioFilterGroupAdd(
-                ioWriteFilterGroup(write), blockIncrNewPack(ioFilterParamList(blockIncrNew(6, 3, 8, 2, 4, 5, NULL, NULL, NULL)))),
+                ioWriteFilterGroup(write),
+                blockIncrNewPack(ioFilterParamList(blockIncrNew(6, 3, 8, 2, 4, 5, NULL, NULL, cipherSpecNewNone(), NULL, NULL)))),
             "block incr");
         TEST_RESULT_VOID(ioWriteOpen(write), "open");
         TEST_RESULT_VOID(ioWrite(write, source), "write");
@@ -1327,16 +1408,174 @@ testRun(void)
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("new filter from pack");
 
+        const CipherSpec *const cipherSpecCbc = cipherSpecNewP(
+            cipherTypeAes256Cbc, BUFSTRDEF(TEST_CIPHER_PASS), .digest = hashTypeSha256);
+
         TEST_RESULT_VOID(
             blockIncrNewPack(
                 ioFilterParamList(
                     blockIncrNew(
-                        3, 3, 8, 2, 4, 5, NULL, compressFilterP(compressTypeGz, 1, .raw = true),
-                        cipherBlockNewP(
-                            cipherModeEncrypt,
-                            cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF(TEST_CIPHER_PASS), .digest = hashTypeSha256),
-                            .header = cipherBlockHeaderNone)))),
+                        3, 3, 8, 2, 4, 5, NULL, compressFilterP(compressTypeGz, 1, .raw = true), cipherSpecCbc,
+                        STRDEF(TEST_GCM_LABEL), STRDEF("pg_data/test")))),
             "block incr pack");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("encrypted filter requires the backup label and the manifest name");
+
+        TEST_ERROR(
+            blockIncrNew(3, 3, 8, 0, 0, 0, NULL, NULL, cipherSpecCbc, NULL, STRDEF("pg_data/test")), AssertError,
+            "backup label and manifest name are required to encrypt");
+        TEST_ERROR(
+            blockIncrNew(3, 3, 8, 0, 0, 0, NULL, NULL, cipherSpecCbc, STRDEF(TEST_GCM_LABEL), NULL), AssertError,
+            "backup label and manifest name are required to encrypt");
+
+        TEST_ERROR(
+            backupFileBlockIncr(
+                &(BackupFile){
+            .blockIncrSize = 3, .blockIncrMapPriorFile = STRDEF("bundle/1"), .manifestFile = STRDEF("pg_data/test")
+        },
+                0, 0, 0, NULL, cipherSpecCbc, STRDEF(TEST_GCM_LABEL), NULL),
+            AssertError, "prior block map label is required to decrypt");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm super blocks and map are bound to their identity");
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("test1"));
+        const String *const gcmName = STRDEF("pg_data/test");
+
+        // Written at bundle offset 5 through the pack, as a remote does, so each super block is bound to an offset past zero
+        source = BUFSTRZ("ABCXYZ123");
+        destination = bufNew(256);
+        write = ioBufferWriteNew(destination);
+
+        TEST_RESULT_VOID(
+            ioFilterGroupAdd(
+                ioWriteFilterGroup(write),
+                blockIncrNewPack(
+                    ioFilterParamList(
+                        blockIncrNew(
+                            3, 3, 8, 0, 0, 5, NULL, compressFilterP(compressTypeGz, 1, .raw = true), cipherSpecGcm,
+                            STRDEF(TEST_GCM_LABEL), gcmName)))),
+            "block incr");
+        TEST_RESULT_VOID(ioWriteOpen(write), "open");
+        TEST_RESULT_VOID(ioWrite(write, source), "write");
+        TEST_RESULT_VOID(ioWriteClose(write), "close");
+
+        TEST_ASSIGN(mapSize, pckReadU64P(ioFilterGroupResultP(ioWriteFilterGroup(write), BLOCK_INCR_FILTER_TYPE)), "map size");
+        map = BUF(bufPtr(destination) + (bufUsed(destination) - (size_t)mapSize), (size_t)mapSize);
+
+        // The map decrypts only as the map of this file in this backup
+        IoRead *mapRead = ioBufferReadNew(map);
+        ioFilterGroupAdd(
+            ioReadFilterGroup(mapRead),
+            cipherFormatNewP(
+                cipherModeDecrypt, cipherSpecGcm, backupFileCipherIdentity(STRDEF(TEST_GCM_LABEL), gcmName), .raw = true));
+        ioReadOpen(mapRead);
+
+        TEST_ERROR(blockMapNewRead(mapRead, 3, 8), CryptoError, "cipher segment 0 failed authentication");
+
+        mapRead = ioBufferReadNew(map);
+        ioFilterGroupAdd(
+            ioReadFilterGroup(mapRead),
+            cipherFormatNewP(
+                cipherModeDecrypt, cipherSpecGcm, backupBlockMapCipherIdentity(STRDEF(TEST_GCM_LABEL), gcmName), .raw = true));
+        ioReadOpen(mapRead);
+
+        const BlockMap *blockMap;
+        TEST_ASSIGN(blockMap, blockMapNewRead(mapRead, 3, 8), "read map");
+        TEST_RESULT_UINT(blockMapSize(blockMap), 3, "three blocks");
+        TEST_RESULT_UINT(blockMapGet(blockMap, 0)->offset, 5, "first super block at the bundle offset");
+
+        // Each super block decrypts at the offset in its map item and at no other
+        const BlockMapItem *const superBlock1 = blockMapGet(blockMap, 1);
+        const Buffer *const superBlock1Data = BUF(bufPtr(destination) + superBlock1->offset - 5, (size_t)superBlock1->size);
+
+        IoRead *superBlockRead = ioBufferReadNew(superBlock1Data);
+        ioFilterGroupAdd(
+            ioReadFilterGroup(superBlockRead),
+            cipherFormatNewP(
+                cipherModeDecrypt, cipherSpecGcm,
+                backupSuperBlockCipherIdentity(STRDEF(TEST_GCM_LABEL), gcmName, blockMapGet(blockMap, 0)->offset), .raw = true));
+        TEST_ERROR(ioReadDrain(superBlockRead), CryptoError, "cipher segment 0 failed authentication");
+
+        // The delta reads every super block at the identity it was written with
+        StringList *const referenceList = strLstNew();
+        strLstAddZ(referenceList, TEST_GCM_LABEL);
+
+        BlockDelta *const blockDelta = blockDeltaNew(blockMap, 3, 8, NULL, cipherSpecGcm, referenceList, gcmName, compressTypeGz);
+        Buffer *const restored = bufNew(0);
+
+        for (unsigned int readIdx = 0; readIdx < blockDeltaReadSize(blockDelta); readIdx++)
+        {
+            const BlockDeltaRead *const read = blockDeltaReadGet(blockDelta, readIdx);
+            IoRead *const readIo = ioBufferReadNewOpen(BUF(bufPtr(destination) + read->offset - 5, (size_t)read->size));
+            const BlockDeltaWrite *deltaWrite = blockDeltaNext(blockDelta, read, readIo);
+
+            while (deltaWrite != NULL)
+            {
+                bufCat(restored, deltaWrite->block);
+                deltaWrite = blockDeltaNext(blockDelta, read, readIo);
+            }
+        }
+
+        TEST_RESULT_STR_Z(strNewBuf(restored), "ABCXYZ123", "restored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - multi-segment block map fails after first segment");
+
+        // Cipher segments of 64 bytes, which only a test can ask for, so that a small map is stored as many of them. The segments
+        // before the one that fails are decrypted and parsed before it is read, so the failure comes after part of the map has
+        // been built.
+        const CipherGcmParam paramSmall = {.digest = "SHA256", .keySize = 32, .derivedKeySize = 32, .segmentSize = 64};
+        const Buffer *const keySmall = cipherGcmKeyDecode(BUFSTRDEF(TEST_CIPHER_KEY));
+        StringList *const fieldSmall = strLstDup(backupBlockMapCipherIdentity(STRDEF(TEST_GCM_LABEL), gcmName));
+
+        strLstInsert(fieldSmall, 0, cipherSpecStanza(cipherSpecGcm));
+
+        const Buffer *const adSmall = cipherGcmAdNew(fieldSmall);
+        BlockMap *const blockMapMany = blockMapNew();
+
+        for (unsigned int blockIdx = 0; blockIdx < 100; blockIdx++)
+        {
+            BlockMapItem blockMapItem = {.superBlockSize = 1, .offset = blockIdx * 3, .size = 3};
+
+            memset(blockMapItem.checksum, (int)blockIdx, sizeof(blockMapItem.checksum));
+            blockMapAdd(blockMapMany, &blockMapItem);
+        }
+
+        Buffer *const mapMany = bufNew(0);
+        IoWrite *const mapManyWrite = ioBufferWriteNew(mapMany);
+
+        ioFilterGroupAdd(ioWriteFilterGroup(mapManyWrite), cipherGcmNewParam(cipherModeEncrypt, keySmall, adSmall, paramSmall));
+        ioWriteOpen(mapManyWrite);
+        blockMapWrite(blockMapMany, mapManyWrite, 1, XX_HASH_SIZE_MAX);
+        ioWriteClose(mapManyWrite);
+
+        TEST_RESULT_BOOL(bufUsed(mapMany) > 64 * 20, true, "stored as more than 20 cipher segments");
+
+        mapRead = ioBufferReadNew(mapMany);
+        ioFilterGroupAdd(ioReadFilterGroup(mapRead), cipherGcmNewParam(cipherModeDecrypt, keySmall, adSmall, paramSmall));
+        ioReadOpen(mapRead);
+        TEST_RESULT_UINT(blockMapSize(blockMapNewRead(mapRead, 1, XX_HASH_SIZE_MAX)), 100, "all blocks read");
+
+        // A bit flipped in the eleventh cipher segment
+        Buffer *const mapTamper = bufDup(mapMany);
+
+        bufPtr(mapTamper)[64 * 10 + 5] ^= 0x01;
+
+        mapRead = ioBufferReadNew(mapTamper);
+        ioFilterGroupAdd(ioReadFilterGroup(mapRead), cipherGcmNewParam(cipherModeDecrypt, keySmall, adSmall, paramSmall));
+        ioReadOpen(mapRead);
+        TEST_ERROR(blockMapNewRead(mapRead, 1, XX_HASH_SIZE_MAX), CryptoError, "cipher segment 10 failed authentication");
+
+        // Cut after the tenth cipher segment, which was not written as the last
+        mapRead = ioBufferReadNew(BUF(bufPtrConst(mapMany), 64 * 10));
+        ioFilterGroupAdd(ioReadFilterGroup(mapRead), cipherGcmNewParam(cipherModeDecrypt, keySmall, adSmall, paramSmall));
+        ioReadOpen(mapRead);
+        TEST_ERROR(blockMapNewRead(mapRead, 1, XX_HASH_SIZE_MAX), CryptoError, "cipher segment 9 failed authentication");
+#endif
     }
 
     // *****************************************************************************************************************************
@@ -1985,6 +2224,120 @@ testRun(void)
 
         TEST_RESULT_INT(backupFileComparator(&file1, &file2), 1, "larger prior map offset sorts after");
         TEST_RESULT_INT(backupFileComparator(&file2, &file1), -1, "smaller prior map offset sorts before");
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("backupComplete() with aes-256-gcm"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        // Create stanza
+        StringList *argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test1");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg1");
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_18);
+
+        cmdStanzaCreate();
+        TEST_RESULT_LOG("P00   INFO: stanza-create for stanza 'test1' on repo1");
+
+        argList = strLstNew();
+        hrnCfgArgRawZ(argList, cfgOptStanza, "test1");
+        hrnCfgArgRawZ(argList, cfgOptRepoPath, TEST_PATH "/repo");
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg1");
+        hrnCfgArgRawZ(argList, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        hrnCfgArgRawStrId(argList, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        InfoBackup *infoBackup = NULL;
+        TEST_ASSIGN(
+            infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain()), "load backup info");
+
+        const CipherSpec *const cipherSpecManifest = infoBackupCipherSpec(infoBackup);
+        Manifest *manifest = NULL;
+
+        TEST_ASSIGN(
+            manifest,
+            manifestNewLoad(
+                ioBufferReadNew(harnessInfoChecksumFormat(REPOSITORY_FORMAT_7, STRDEF(TEST_MANIFEST_GCM))), cipherSpecManifest),
+            "load manifest");
+
+        const String *const manifestFileName = STRDEF(STORAGE_REPO_BACKUP "/" TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE);
+        const String *const manifestCopyFileName = STRDEF(
+            STORAGE_REPO_BACKUP "/" TEST_GCM_LABEL "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT);
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("in-progress manifest");
+
+        TEST_RESULT_VOID(backupManifestSaveCopy(manifest, cipherSpecManifest, false), "save in-progress manifest");
+        TEST_RESULT_STR_Z(
+            manifestData(manifestLoadFileP(storageRepo(), manifestFileName, cipherSpecManifest, .inProgress = true))->backupLabel,
+            TEST_GCM_LABEL, "load in-progress manifest");
+        TEST_ERROR(
+            manifestLoadFileP(storageRepo(), manifestFileName, cipherSpecManifest), FileMissingError,
+            "unable to load backup manifest file '" TEST_PATH "/repo/backup/test1/" TEST_GCM_LABEL "/backup.manifest':\n"
+            "FileMissingError: unable to open missing file '" TEST_PATH "/repo/backup/test1/" TEST_GCM_LABEL "/backup.manifest'"
+            " for read");
+
+        const Buffer *const manifestCopy = storageGetP(storageNewReadP(storageRepo(), manifestCopyFileName));
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("final manifest is saved, not copied from the in-progress manifest");
+
+        TEST_RESULT_VOID(backupComplete(infoBackup, manifest), "complete backup");
+
+        const Buffer *const manifestFinal = storageGetP(storageNewReadP(storageRepo(), manifestFileName));
+
+        TEST_RESULT_STR_Z(strNewBuf(BUF(bufPtrConst(manifestFinal), 8)), "PGBR007G", "format 7 prefix");
+        TEST_RESULT_STR_Z(
+            manifestData(manifestLoadFileP(storageRepo(), manifestFileName, cipherSpecManifest))->backupLabel, TEST_GCM_LABEL,
+            "load final manifest");
+        TEST_RESULT_BOOL(
+            bufEq(storageGetP(storageNewReadP(storageRepo(), manifestCopyFileName)), manifestCopy), true,
+            "in-progress manifest is not replaced");
+        TEST_RESULT_BOOL(infoBackupLabelExists(infoBackup, STRDEF(TEST_GCM_LABEL)), true, "backup added to backup info");
+
+        // The in-progress manifest does not decrypt as the final manifest
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(manifestFileName), manifestCopy, .comment = "in-progress bytes as final");
+        TEST_ERROR(
+            manifestLoadFileP(storageRepo(), manifestFileName, cipherSpecManifest), CryptoError,
+            "unable to load backup manifest file '" TEST_PATH "/repo/backup/test1/" TEST_GCM_LABEL "/backup.manifest':\n"
+            "CryptoError: cipher segment 0 failed authentication\n"
+            "HINT: is or was the repo encrypted?");
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(manifestFileName), manifestFinal, .comment = "restore final manifest");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("history manifest is bound to its label and kind");
+
+        const String *const historyFileName = STRDEF(
+            STORAGE_REPO_BACKUP "/" BACKUP_PATH_HISTORY "/2019/" TEST_GCM_LABEL BACKUP_MANIFEST_EXT ".gz");
+
+        StorageRead *read = storageNewReadP(storageRepo(), manifestFileName);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(read)), cipherModeDecrypt, cipherSpecManifest,
+            manifestCipherIdentity(manifestFileName));
+        const Buffer *const manifestPlain = storageGetP(read);
+
+        read = storageNewReadP(storageRepo(), historyFileName);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(read)), cipherModeDecrypt, cipherSpecManifest,
+            backupManifestHistoryCipherIdentity(STRDEF(TEST_GCM_LABEL)));
+        ioFilterGroupAdd(ioReadFilterGroup(storageReadIo(read)), decompressFilterP(compressTypeGz));
+        TEST_RESULT_BOOL(bufEq(storageGetP(read), manifestPlain), true, "history is the final manifest");
+
+        read = storageNewReadP(storageRepo(), historyFileName);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(read)), cipherModeDecrypt, cipherSpecManifest,
+            manifestCipherIdentity(manifestFileName));
+        TEST_ERROR(storageGetP(read), CryptoError, "cipher segment 0 failed authentication");
+#endif
     }
 
     // Offline tests should only be used to test offline functionality and errors easily tested in offline mode

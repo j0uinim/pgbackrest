@@ -1,12 +1,18 @@
 /***********************************************************************************************************************************
 Test Annotate Command
 ***********************************************************************************************************************************/
+
+#include "common/crypto/cipherGcm.h"
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "storage/posix/storage.h"
 
 #include "harness/config.h"
 #include "harness/info.h"
+
+/***********************************************************************************************************************************
+Key and sub keys for the aes-256-gcm repository
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test Run
@@ -209,6 +215,110 @@ testRun(void)
         HRN_CFG_LOAD(cfgCmdAnnotate, argListAnnotation);
 
         TEST_ERROR(cmdAnnotate(), BackupSetInvalidError, "no backup set to annotate found");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("annotate backup with aes-256-gcm");
+
+        argListAnnotation = strLstNew();
+        hrnCfgArgRawZ(argListAnnotation, cfgOptRepoPath, TEST_PATH "/repo-enc");
+        hrnCfgArgRawZ(argListAnnotation, cfgOptStanza, "stanza1");
+        hrnCfgArgRawStrId(argListAnnotation, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        hrnCfgArgRawZ(argListAnnotation, cfgOptAnnotation, "key1=value1");
+        hrnCfgArgRawZ(argListAnnotation, cfgOptSet, "20201116-200000F");
+        HRN_CFG_LOAD(cfgCmdAnnotate, argListAnnotation);
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("stanza1"));
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), INFO_BACKUP_PATH_FILE,
+            "[backup:current]\n"
+            "20201116-200000F={\"backrest-format\":7,\"backrest-version\":\"2.58.0dev\","
+            "\"backup-archive-start\":\"000000010000000000000004\",\"backup-archive-stop\":\"000000010000000000000004\","
+            "\"backup-info-repo-size\":3159000,\"backup-info-repo-size-delta\":3100,\"backup-info-size\":26897000,"
+            "\"backup-info-size-delta\":26897020,\"backup-timestamp-start\":1605556800,\"backup-timestamp-stop\":1605556802,"
+            "\"backup-type\":\"full\",\"db-id\":1,\"option-archive-check\":true,\"option-archive-copy\":false,"
+            "\"option-backup-standby\":false,\"option-checksum-page\":false,\"option-compress\":false,\"option-hardlink\":true,"
+            "\"option-online\":true}\n"
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_MANIFEST "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            "\n"
+            "[db]\n"
+            "db-catalog-version=202506291\n"
+            "db-control-version=1800\n"
+            "db-id=1\n"
+            "db-system-id=6626363367545678089\n"
+            "db-version=\"18\"\n"
+            "\n"
+            "[db:history]\n"
+            "1={\"db-catalog-version\":202506291,\"db-control-version\":1800,\"db-system-id\":6626363367545678089"
+            ",\"db-version\":\"18\"}\n",
+            .cipherSpec = cipherSpecGcm);
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20201116-200000F/" BACKUP_MANIFEST_FILE,
+            TEST_MANIFEST_HEADER
+            TEST_MANIFEST_TARGET
+            "\n"
+            "[cipher]\n"
+            "cipher-pass=\"" TEST_CIPHER_KEY_BACKUP "\"\n"
+            "cipher-type=\"aes-256-gcm\"\n"
+            TEST_MANIFEST_DB
+            TEST_MANIFEST_FILE
+            TEST_MANIFEST_FILE_DEFAULT
+            TEST_MANIFEST_LINK
+            TEST_MANIFEST_LINK_DEFAULT
+            TEST_MANIFEST_PATH
+            TEST_MANIFEST_PATH_DEFAULT,
+            .cipherSpec = cipherSpecNewP(cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY_MANIFEST), .stanza = STRDEF("stanza1")));
+
+        TEST_RESULT_VOID(cmdAnnotate(), "annotate 20201116-200000F backup set");
+        TEST_RESULT_LOG("P00   INFO: backup set '20201116-200000F' to annotate found in repo1");
+
+        TEST_RESULT_STR_Z(
+            strNewBuf(BUF(bufPtrConst(storageGetP(storageNewReadP(storageRepo(), INFO_BACKUP_PATH_FILE_STR))), 8)), "PGBR007G",
+            "backup.info has the format 7 prefix");
+
+        const InfoBackup *infoBackup = NULL;
+
+        TEST_ASSIGN(infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup.info");
+        const KeyValue *annotationKv = varKv(infoBackupDataByLabel(infoBackup, STRDEF("20201116-200000F"))->backupAnnotation);
+
+        TEST_RESULT_STR_Z(varStr(kvGet(annotationKv, VARSTRDEF("key1"))), "value1", "annotation saved");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("annotate - aes-256-gcm refuses another backup's manifest");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/20201117-200000F/" BACKUP_MANIFEST_FILE,
+            storageGetP(storageNewReadP(storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20201116-200000F/" BACKUP_MANIFEST_FILE))),
+            .comment = "copy manifest of 20201116-200000F to 20201117-200000F");
+
+        argListAnnotation = strLstDup(argListAnnotation);
+        strLstAddZ(argListAnnotation, "--" CFGOPT_ANNOTATION "=key2=value2");
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+        HRN_CFG_LOAD(cfgCmdAnnotate, argListAnnotation);
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+
+        TEST_ERROR(
+            cmdAnnotate(), CommandError, CFGCMD_ANNOTATE " command encountered 1 error(s), check the log file for details");
+        TEST_RESULT_LOG(
+            "P00  ERROR: [095]: repo1: unable to load backup manifest file '" TEST_PATH "/repo-enc/backup/stanza1/20201117-200000F/"
+            BACKUP_MANIFEST_FILE "':\n"
+            "            CryptoError: cipher segment 0 failed authentication\n"
+            "            HINT: is or was the repo encrypted?");
+
+        TEST_ASSIGN(infoBackup, infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cipherSpecGcm), "load backup.info");
+        annotationKv = varKv(infoBackupDataByLabel(infoBackup, STRDEF("20201116-200000F"))->backupAnnotation);
+
+        TEST_RESULT_STR_Z(varStr(kvGet(annotationKv, VARSTRDEF("key1"))), "value1", "annotation kept");
+        TEST_RESULT_PTR(kvGet(annotationKv, VARSTRDEF("key2")), NULL, "annotation not saved");
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

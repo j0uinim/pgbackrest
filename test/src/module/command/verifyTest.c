@@ -1,8 +1,11 @@
 /***********************************************************************************************************************************
 Test Verify Command
 ***********************************************************************************************************************************/
+
 #include "command/backup/protocol.h"
 #include "command/stanza/create.h"
+#include "common/crypto/cipherGcm.h"
+#include "common/format/cipherFormat.h"
 #include "common/io/bufferRead.h"
 #include "postgres/interface.h"
 #include "postgres/version.h"
@@ -10,11 +13,15 @@ Test Verify Command
 
 #include "harness/backup.h"
 #include "harness/config.h"
+#include "harness/crypto.h"
 #include "harness/info.h"
 #include "harness/postgres.h"
 #include "harness/pq.h"
-
 #include "harness/protocol.h"
+
+/***********************************************************************************************************************************
+An aes-256-gcm repository key
+***********************************************************************************************************************************/
 
 /***********************************************************************************************************************************
 Test Run
@@ -406,6 +413,66 @@ testRun(void)
         TEST_RESULT_PTR_NE(manifest, NULL, "manifest set");
         TEST_RESULT_UINT(backupResult.status, backupValid, "manifest usable");
         TEST_RESULT_LOG("P00 DETAIL: backup '20181119-152138F' manifest.copy does not match manifest");
+
+#ifdef CIPHER_GCM_SUPPORTED
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm - manifest copy is in progress, not compared or used");
+
+        #define TEST_MANIFEST_GCM                                                                                                  \
+            TEST_MANIFEST_HEADER                                                                                                   \
+            TEST_MANIFEST_DB_94                                                                                                    \
+            TEST_MANIFEST_OPTION_ALL                                                                                               \
+            TEST_MANIFEST_TARGET                                                                                                   \
+            "\n"                                                                                                                   \
+            "[cipher]\n"                                                                                                           \
+            "cipher-pass=\"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=\"\n"                                                       \
+            "cipher-type=\"aes-256-gcm\"\n"                                                                                        \
+            TEST_MANIFEST_DB                                                                                                       \
+            TEST_MANIFEST_FILE                                                                                                     \
+            TEST_MANIFEST_FILE_DEFAULT                                                                                             \
+            TEST_MANIFEST_LINK                                                                                                     \
+            TEST_MANIFEST_LINK_DEFAULT                                                                                             \
+            TEST_MANIFEST_PATH                                                                                                     \
+            TEST_MANIFEST_PATH_DEFAULT
+
+        const CipherSpec *const cipherSpecGcm = cipherSpecNewP(
+            cipherTypeAes256Gcm, BUFSTRDEF(TEST_CIPHER_KEY), .stanza = STRDEF("db"));
+
+        HRN_INFO_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/" TEST_BACKUP_LABEL_FULL "/" BACKUP_MANIFEST_FILE, TEST_MANIFEST_GCM,
+            .cipherSpec = cipherSpecGcm, .comment = "final manifest");
+        HRN_INFO_PUT(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/" TEST_BACKUP_LABEL_FULL "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT,
+            TEST_MANIFEST_GCM, .cipherSpec = cipherSpecGcm, .comment = "in-progress manifest");
+
+        backupResult.status = backupValid;
+        TEST_ASSIGN(manifest, verifyManifestFile(&backupResult, cipherSpecGcm, false, infoPg, &jobErrorTotal), "verify manifest");
+        TEST_RESULT_PTR_NE(manifest, NULL, "manifest set");
+        TEST_RESULT_UINT(backupResult.status, backupValid, "manifest usable");
+
+        HRN_STORAGE_REMOVE(storageRepoWrite(), STORAGE_REPO_BACKUP "/" TEST_BACKUP_LABEL_FULL "/" BACKUP_MANIFEST_FILE);
+
+        backupResult.status = backupValid;
+        TEST_ASSIGN(manifest, verifyManifestFile(&backupResult, cipherSpecGcm, false, infoPg, &jobErrorTotal), "verify manifest");
+        TEST_RESULT_PTR(manifest, NULL, "manifest not set");
+        TEST_RESULT_UINT(backupResult.status, backupInvalid, "in-progress manifest not used - backup invalid");
+        TEST_RESULT_LOG(
+            "P00 DETAIL: unable to open missing file '" TEST_PATH "/repo/backup/db/20181119-152138F/backup.manifest' for read");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("aes-256-gcm backup with neither manifest may have expired");
+
+        HRN_STORAGE_REMOVE(
+            storageRepoWrite(), STORAGE_REPO_BACKUP "/" TEST_BACKUP_LABEL_FULL "/" BACKUP_MANIFEST_FILE INFO_COPY_EXT);
+
+        backupResult.status = backupValid;
+        TEST_ASSIGN(manifest, verifyManifestFile(&backupResult, cipherSpecGcm, false, infoPg, &jobErrorTotal), "verify manifest");
+        TEST_RESULT_PTR(manifest, NULL, "manifest not set");
+        TEST_RESULT_UINT(backupResult.status, backupMissingManifest, "manifest missing");
+        TEST_RESULT_LOG(
+            "P00 DETAIL: unable to open missing file '" TEST_PATH "/repo/backup/db/20181119-152138F/backup.manifest' for read\n"
+            "P00 DETAIL: manifest missing for '20181119-152138F' - backup may have expired");
+#endif
 
         harnessLogLevelReset();
     }
@@ -944,7 +1011,7 @@ testRun(void)
         String *filePathName = strNewZ(STORAGE_REPO_ARCHIVE "/testfile");
         HRN_STORAGE_PUT_EMPTY(storageRepoWrite(), strZ(filePathName));
         TEST_RESULT_UINT(
-            verifyFile(filePathName, 0, NULL, compressTypeNone, HASH_TYPE_SHA1_ZERO_BUF, 0, cipherSpecNewNone()),
+            verifyFile(filePathName, 0, NULL, compressTypeNone, HASH_TYPE_SHA1_ZERO_BUF, 0, cipherSpecNewNone(), NULL),
             verifyOk, "file ok");
 
         // -------------------------------------------------------------------------------------------------------------------------
@@ -952,7 +1019,7 @@ testRun(void)
 
         HRN_STORAGE_PUT_Z(storageRepoWrite(), strZ(filePathName), fileContents);
         TEST_RESULT_UINT(
-            verifyFile(filePathName, 0, NULL, compressTypeNone, fileChecksum, 0, cipherSpecNewNone()),
+            verifyFile(filePathName, 0, NULL, compressTypeNone, fileChecksum, 0, cipherSpecNewNone(), NULL),
             verifySizeInvalid, "file size invalid");
 
         // -------------------------------------------------------------------------------------------------------------------------
@@ -960,7 +1027,8 @@ testRun(void)
 
         TEST_RESULT_UINT(
             verifyFile(
-                strNewFmt(STORAGE_REPO_ARCHIVE "/missingFile"), 0, NULL, compressTypeNone, fileChecksum, 0, cipherSpecNewNone()),
+                strNewFmt(STORAGE_REPO_ARCHIVE "/missingFile"), 0, NULL, compressTypeNone, fileChecksum, 0, cipherSpecNewNone(),
+                NULL),
             verifyFileMissing, "file missing");
 
         // -------------------------------------------------------------------------------------------------------------------------
@@ -976,12 +1044,12 @@ testRun(void)
         TEST_RESULT_UINT(
             verifyFile(
                 filePathName, 0, NULL, compressTypeGz, fileChecksum, fileSize,
-                cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("pass"), .digest = hashTypeSha1)),
+                cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("pass"), .digest = hashTypeSha1), NULL),
             verifyOk, "file encrypted compressed ok");
         TEST_RESULT_UINT(
             verifyFile(
                 filePathName, 0, NULL, compressTypeGz, bufNewDecode(encodingHex, STRDEF("aa")), fileSize,
-                cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("pass"), .digest = hashTypeSha1)),
+                cipherSpecNewP(cipherTypeAes256Cbc, BUFSTRDEF("pass"), .digest = hashTypeSha1), NULL),
             verifyChecksumMismatch, "file encrypted compressed checksum mismatch");
     }
 
@@ -2417,9 +2485,9 @@ testRun(void)
             "P00 DETAIL: path '11-2/0000000500000008' does not contain any valid WAL to be processed\n"
             "P00 DETAIL: path '11-2/0000000500000009' does not contain any valid WAL to be processed\n"
             "P00 DETAIL: repository format 1234 requires a newer version of pgBackRest\n"
-            "            HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 6.\n"
+            "            HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 7.\n"
             "P00 DETAIL: repository format 1234 requires a newer version of pgBackRest\n"
-            "            HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 6.");
+            "            HINT: pgBackRest " PROJECT_VERSION " supports repository format 5 to 7.");
     }
 
     if (testBegin("cmdBackup() and verifyProcess()"))
@@ -2619,6 +2687,307 @@ testRun(void)
             "P00 DETAIL: archiveId: 11-1, wal start: 0000000105D9758F000000FF, wal stop: 0000000105D9759000000000");
 
         hrnCfgEnvKeyRemoveRaw(cfgOptRepoCipherPass, 2);
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("cmdBackup() and verifyProcess() with aes-256-gcm"))
+    {
+#ifdef CIPHER_GCM_SUPPORTED
+        // Set log level to detail, which shows the WAL copied into the backup
+        harnessLogLevelSet(logLevelDetail);
+
+        // The test expects the timezone to be UTC
+        hrnTzSet("UTC");
+        // Replace checksums since they can differ between architectures (e.g. 32/64 bit)
+        hrnLogReplaceAdd("\\) checksum [a-f0-9]{40}", "[a-f0-9]{40}$", "SHA1", false);
+        hrnLogReplaceAdd("[0-9A-F]{24}-[a-f0-9]{40}", "[a-f0-9]{40}$", "SHA1", false);
+
+        StringList *const argListGcm = strLstDup(argListBase);
+        hrnCfgArgRawStrId(argListGcm, cfgOptRepoCipherType, cipherTypeAes256Gcm);
+        hrnCfgEnvRawZ(cfgOptRepoCipherPass, TEST_CIPHER_KEY);
+
+        StringList *argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg1");
+        hrnCfgArgRawBool(argList, cfgOptOnline, false);
+        HRN_CFG_LOAD(cfgCmdStanzaCreate, argList);
+
+        HRN_PG_CONTROL_PUT(storagePgWrite(), PG_VERSION_11);
+        HRN_STORAGE_PUT_Z(storagePgWrite(), PG_FILE_PGVERSION, PG_VERSION_11_Z, .timeModified = BACKUP_EPOCH - 10);
+
+        TEST_RESULT_VOID(cmdStanzaCreate(), "stanza create");
+        TEST_RESULT_LOG("P00   INFO: stanza-create for stanza 'db' on repo1");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("full backup with the WAL copied into the backup");
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg1");
+        hrnCfgArgRawZ(argList, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawBool(argList, cfgOptRepoBundle, true);
+        hrnCfgArgRawBool(argList, cfgOptArchiveCopy, true);
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        hrnBackupPqScriptP(PG_VERSION_11, BACKUP_EPOCH, .cipherSpecMain = cfgCipherSpecMain());
+        TEST_RESULT_VOID(hrnCmdBackup(), "backup");
+        TEST_RESULT_LOG(
+            "P00   INFO: execute backup start: backup begins after the next regular checkpoint completes\n"
+            "P00   INFO: backup start archive = 0000000105D944C000000000, lsn = 5d944c0/0\n"
+            "P00   INFO: check archive for prior segment 0000000105D944BF000000FF\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg1/PG_VERSION (bundle 1/0, 2B, 0.02%) checksum [SHA1]\n"
+            "P01 DETAIL: backup file " TEST_PATH "/pg1/global/pg_control (bundle 1/66, 8KB, 100.00%) checksum [SHA1]\n"
+            "P00   INFO: execute backup stop and wait for all WAL segments to archive\n"
+            "P00   INFO: backup stop archive = 0000000105D944C000000000, lsn = 5d944c0/800000\n"
+            "P00 DETAIL: wrote 'backup_label' file returned from backup stop function\n"
+            "P00   INFO: check archive for segment(s) 0000000105D944C000000000:0000000105D944C000000000\n"
+            "P00 DETAIL: copy segment 0000000105D944C000000000 to backup\n"
+            "P00   INFO: new backup label = 20191002-070640F\n"
+            "P00   INFO: full backup size = 16MB, file total = 4");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("verify WAL, bundled files, and WAL copied into the backup");
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptOutput, "text");
+        hrnCfgArgRawZ(argList, cfgOptVerbose, "y");
+        HRN_CFG_LOAD(cfgCmdVerify, argList);
+
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: ok\n"
+            "  archiveId: 11-1, total WAL checked: 2, total valid WAL: 2\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0\n"
+            "  backup: 20191002-070640F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG(
+            "P00 DETAIL: archiveId: 11-1, wal start: 0000000105D944BF000000FF, wal stop: 0000000105D944C000000000");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("backup_label is bound to its label and name");
+
+        const Manifest *const manifest = manifestLoadFileP(
+            storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20191002-070640F/" BACKUP_MANIFEST_FILE),
+            infoBackupCipherSpec(infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain())));
+        const String *const backupLabelFile = STRDEF(STORAGE_REPO_BACKUP "/20191002-070640F/pg_data/backup_label.gz");
+
+        StorageRead *read = storageNewReadP(storageRepo(), backupLabelFile);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(read)), cipherModeDecrypt, manifestCipherSpec(manifest),
+            HRN_CIPHER_IDENTITY("file|20191002-070640F|pg_data/backup_label"));
+        ioFilterGroupAdd(ioReadFilterGroup(storageReadIo(read)), decompressFilterP(compressTypeGz));
+        TEST_RESULT_STR_Z(strNewBuf(storageGetP(read)), "BACKUP_LABEL_DATA", "decrypts");
+
+        read = storageNewReadP(storageRepo(), backupLabelFile);
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(read)), cipherModeDecrypt, manifestCipherSpec(manifest),
+            HRN_CIPHER_IDENTITY("file|20191002-070640F|pg_data/tablespace_map"));
+        TEST_ERROR(storageGetP(read), CryptoError, "cipher segment 0 failed authentication");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("WAL with the same content under the name of another segment does not decrypt");
+
+        // The harness writes every segment with the same content, so the two files differ only in the name they are bound to
+        const String *const walPrior = strNewFmt(
+            STORAGE_REPO_ARCHIVE "/11-1/0000000105D944BF/%s",
+            strZ(strLstGet(storageListP(storageRepo(), STRDEF(STORAGE_REPO_ARCHIVE "/11-1/0000000105D944BF")), 0)));
+        const String *const walStart = strNewFmt(
+            STORAGE_REPO_ARCHIVE "/11-1/0000000105D944C0/%s",
+            strZ(strLstGet(storageListP(storageRepo(), STRDEF(STORAGE_REPO_ARCHIVE "/11-1/0000000105D944C0")), 0)));
+
+        TEST_RESULT_STR(strSub(walPrior, strSize(walPrior) - 40), strSub(walStart, strSize(walStart) - 40), "same checksum");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(walStart), storageGetP(storageNewReadP(storageRepo(), walPrior)),
+            .comment = "prior segment's bytes under the start segment's name");
+
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: error\n"
+            "  archiveId: 11-1, total WAL checked: 2, total valid WAL: 1\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 1\n"
+            "  backup: 20191002-070640F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG(
+            "P01   INFO: invalid result 11-1/0000000105D944C0/0000000105D944C000000000-[SHA1]: [95] raised from local-1 shim"
+            " protocol: cipher segment 0 failed authentication\n"
+            "P00 DETAIL: archiveId: 11-1, wal start: 0000000105D944BF000000FF, wal stop: 0000000105D944C000000000");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("block incremental backup");
+
+        harnessLogLevelSet(logLevelWarn);
+
+        // A relation whose blocks all differ, stored alone and uncompressed so that its super blocks have the same stored size
+        Buffer *const relation = bufNew(256 * 1024);
+
+        for (unsigned int blockIdx = 0; blockIdx < 32; blockIdx++)
+            memset(bufPtr(relation) + blockIdx * 8192, (int)blockIdx + 1, 8192);
+
+        bufUsedSet(relation, bufSize(relation));
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptPgPath, TEST_PATH "/pg1");
+        hrnCfgArgRawZ(argList, cfgOptRepoRetentionFull, "1");
+        hrnCfgArgRawBool(argList, cfgOptRepoBundle, true);
+        hrnCfgArgRawZ(argList, cfgOptRepoBundleLimit, "8KiB");
+        hrnCfgArgRawBool(argList, cfgOptRepoBlock, true);
+        hrnCfgArgRawZ(argList, cfgOptRepoBlockSizeSuperFull, "32KiB");
+        hrnCfgArgRawZ(argList, cfgOptCompressType, "none");
+        hrnCfgArgRawStrId(argList, cfgOptType, backupTypeFull);
+        HRN_CFG_LOAD(cfgCmdBackup, argList);
+
+        HRN_STORAGE_PUT(storagePgWrite(), PG_PATH_BASE "/1/2", relation, .timeModified = BACKUP_EPOCH + 100000 - 10);
+
+        hrnBackupPqScriptP(PG_VERSION_11, BACKUP_EPOCH + 100000, .cipherSpecMain = cfgCipherSpecMain());
+        TEST_RESULT_VOID(hrnCmdBackup(), "backup");
+        TEST_RESULT_LOG("");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("verify block incremental files by the checksum of what is stored");
+
+        argList = strLstDup(argListGcm);
+        hrnCfgArgRawZ(argList, cfgOptOutput, "text");
+        hrnCfgArgRawZ(argList, cfgOptVerbose, "y");
+        HRN_CFG_LOAD(cfgCmdVerify, argList);
+
+        // The WAL moved above is still reported
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: error\n"
+            "  archiveId: 11-1, total WAL checked: 4, total valid WAL: 3\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 1\n"
+            "  backup: 20191002-070640F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0\n"
+            "  backup: 20191003-105320F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG("");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("a super block moved to the offset of another is invalid");
+
+        const String *const relationRepo = STRDEF(STORAGE_REPO_BACKUP "/20191003-105320F/pg_data/base/1/2.pgbi");
+        const ManifestFile fileBlock = manifestFileFind(
+            manifestLoadFileP(
+                storageRepo(), STRDEF(STORAGE_REPO_BACKUP "/20191003-105320F/" BACKUP_MANIFEST_FILE),
+                infoBackupCipherSpec(infoBackupLoadFile(storageRepo(), INFO_BACKUP_PATH_FILE_STR, cfgCipherSpecMain()))),
+            STRDEF("pg_data/base/1/2"));
+
+        TEST_RESULT_BOOL(fileBlock.blockIncrMapSize != 0, true, "block incremental");
+        TEST_RESULT_UINT(fileBlock.bundleId, 0, "stored alone");
+
+        Buffer *const relationBlock = storageGetP(storageNewReadP(storageRepo(), relationRepo));
+        const size_t superBlockSize = (size_t)(fileBlock.sizeRepo - fileBlock.blockIncrMapSize) / 8;
+        Buffer *const superBlock0 = bufNewC(bufPtr(relationBlock), superBlockSize);
+
+        memmove(bufPtr(relationBlock), bufPtr(relationBlock) + superBlockSize, superBlockSize);
+        memcpy(bufPtr(relationBlock) + superBlockSize, bufPtr(superBlock0), superBlockSize);
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(relationRepo), relationBlock, .comment = "swap super blocks 0 and 1");
+
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: error\n"
+            "  archiveId: 11-1, total WAL checked: 4, total valid WAL: 3\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 1\n"
+            "  backup: 20191002-070640F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0\n"
+            "  backup: 20191003-105320F, status: invalid, total files checked: 4, total valid files: 3\n"
+            "    missing: 0, checksum invalid: 1, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG("");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("WAL cut at a cipher segment boundary is invalid");
+
+        // The reason a file is invalid is logged as info
+        harnessLogLevelSet(logLevelInfo);
+
+        const Buffer *const walPriorStored = storageGetP(storageNewReadP(storageRepo(), walPrior));
+
+        TEST_RESULT_UINT(bufUsed(walPriorStored), 8 + 40 + 16 * 1024 * 1024 + 16 * 17, "stored as 17 cipher segments");
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(walPrior), BUF(bufPtrConst(walPriorStored), 8 + 2 * 1024 * 1024),
+            .comment = "cut after the second cipher segment");
+
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: error\n"
+            "  archiveId: 11-1, total WAL checked: 4, total valid WAL: 2\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 2\n"
+            "  backup: 20191002-070640F, status: valid, total files checked: 4, total valid files: 4\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 0\n"
+            "  backup: 20191003-105320F, status: invalid, total files checked: 4, total valid files: 3\n"
+            "    missing: 0, checksum invalid: 1, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG(
+            "P01   INFO: invalid result 11-1/0000000105D944BF/0000000105D944BF000000FF-[SHA1]: [95] raised from local-1 shim"
+            " protocol: cipher segment 1 failed authentication\n"
+            "P01   INFO: invalid result 11-1/0000000105D944C0/0000000105D944C000000000-[SHA1]: [95] raised from local-1 shim"
+            " protocol: cipher segment 0 failed authentication\n"
+            "P01   INFO: invalid checksum '20191003-105320F/pg_data/base/1/2.pgbi'");
+
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(walPrior), walPriorStored, .comment = "WAL as it was stored");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("files of a backup changed in the repository are invalid");
+
+        // A bit flipped in a bundled file, which is verified by the checksum of what is stored
+        const String *const bundleRepo = STRDEF(STORAGE_REPO_BACKUP "/20191002-070640F/bundle/1");
+        Buffer *const bundleTamper = storageGetP(storageNewReadP(storageRepo(), bundleRepo));
+
+        bufPtr(bundleTamper)[manifestFileFind(manifest, STRDEF("pg_data/global/pg_control")).bundleOffset + 40] ^= 0x01;
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(bundleRepo), bundleTamper, .comment = "bit flipped in pg_control");
+
+        // A bit flipped in the WAL copied into the backup, which has no checksum of what is stored and so is decrypted
+        const String *const walCopyRepo = STRDEF(
+            STORAGE_REPO_BACKUP "/20191002-070640F/pg_data/pg_wal/0000000105D944C000000000.gz");
+        Buffer *const walCopyTamper = storageGetP(storageNewReadP(storageRepo(), walCopyRepo));
+
+        TEST_RESULT_PTR(
+            manifestFileFind(manifest, STRDEF("pg_data/pg_wal/0000000105D944C000000000")).checksumRepoSha1, NULL,
+            "no checksum of what is stored");
+
+        bufPtr(walCopyTamper)[bufUsed(walCopyTamper) - 1] ^= 0x01;
+        HRN_STORAGE_PUT(storageRepoWrite(), strZ(walCopyRepo), walCopyTamper, .comment = "bit flipped in the WAL copy");
+
+        // One byte cut from a file stored alone
+        const Buffer *const backupLabelStored = storageGetP(storageNewReadP(storageRepo(), backupLabelFile));
+
+        HRN_STORAGE_PUT(
+            storageRepoWrite(), strZ(backupLabelFile), BUF(bufPtrConst(backupLabelStored), bufUsed(backupLabelStored) - 1),
+            .comment = "backup_label cut by one byte");
+
+        TEST_RESULT_STR_Z(
+            verifyProcess(cfgOptionBool(cfgOptVerbose)),
+            "stanza: db\n"
+            "status: error\n"
+            "  archiveId: 11-1, total WAL checked: 4, total valid WAL: 3\n"
+            "    missing: 0, checksum invalid: 0, size invalid: 0, other: 1\n"
+            "  backup: 20191002-070640F, status: invalid, total files checked: 4, total valid files: 1\n"
+            "    missing: 0, checksum invalid: 2, size invalid: 0, other: 1\n"
+            "  backup: 20191003-105320F, status: invalid, total files checked: 4, total valid files: 3\n"
+            "    missing: 0, checksum invalid: 1, size invalid: 0, other: 0",
+            "verify");
+        TEST_RESULT_LOG(
+            "P01   INFO: invalid result 11-1/0000000105D944C0/0000000105D944C000000000-[SHA1]: [95] raised from local-1 shim"
+            " protocol: cipher segment 0 failed authentication\n"
+            "P01   INFO: invalid checksum '20191002-070640F/pg_data/backup_label.gz'\n"
+            "P01   INFO: invalid checksum '20191002-070640F/bundle/1'\n"
+            "P01   INFO: invalid result 20191002-070640F/pg_data/pg_wal/0000000105D944C000000000.gz: [95] raised from local-1 shim"
+            " protocol: cipher segment 0 failed authentication\n"
+            "P01   INFO: invalid checksum '20191003-105320F/pg_data/base/1/2.pgbi'");
+
+        hrnLogReplaceClear();
+        hrnCfgEnvRemoveRaw(cfgOptRepoCipherPass);
+#endif
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

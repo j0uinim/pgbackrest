@@ -1,6 +1,42 @@
 /***********************************************************************************************************************************
+Save the backup manifest to a file in the backup path, i.e. backup.manifest or its copy, encrypted with the identity of its name
+***********************************************************************************************************************************/
+static void
+backupManifestSaveFile(Manifest *const manifest, const CipherSpec *const cipherSpecManifest, const char *const fileName)
+{
+    FUNCTION_LOG_BEGIN(logLevelDebug);
+        FUNCTION_LOG_PARAM(MANIFEST, manifest);
+        FUNCTION_LOG_PARAM(CIPHER_SPEC, cipherSpecManifest);
+        FUNCTION_LOG_PARAM(STRINGZ, fileName);
+    FUNCTION_LOG_END();
+
+    ASSERT(manifest != NULL);
+    ASSERT(fileName != NULL);
+
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        const String *const pathFileName = strNewFmt(
+            STORAGE_REPO_BACKUP "/%s/%s", strZ(manifestData(manifest)->backupLabel), fileName);
+
+        // Open file for write
+        IoWrite *const write = storageWriteIo(storageNewWriteP(storageRepoWrite(), pathFileName));
+
+        // Add encryption filter if required
+        cipherFormatFilterGroupAdd(
+            ioWriteFilterGroup(write), cipherModeEncrypt, cipherSpecManifest, manifestCipherIdentity(pathFileName));
+
+        // Save file
+        manifestSave(manifest, write);
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    FUNCTION_LOG_RETURN_VOID();
+}
+
+/***********************************************************************************************************************************
 Save a copy of the backup manifest during processing to preserve checksums for a possible resume. Only save the final copy when
-resume is disabled since an incremental copy will not be used in a future backup unless resume is enabled beforehand.
+resume is disabled since an incremental copy will not be used in a future backup unless resume is enabled beforehand. With
+aes-256-gcm the copy is the in-progress manifest and there is no final copy, since the final manifest is saved on its own.
 ***********************************************************************************************************************************/
 static void
 backupManifestSaveCopy(Manifest *const manifest, const CipherSpec *const cipherSpecManifest, const bool final)
@@ -12,26 +48,10 @@ backupManifestSaveCopy(Manifest *const manifest, const CipherSpec *const cipherS
     FUNCTION_LOG_END();
 
     ASSERT(manifest != NULL);
+    ASSERT(cipherSpecManifest != NULL);
 
-    if (final || cfgOptionBool(cfgOptResume))
-    {
-        MEM_CONTEXT_TEMP_BEGIN()
-        {
-            // Open file for write
-            IoWrite *const write = storageWriteIo(
-                storageNewWriteP(
-                    storageRepoWrite(),
-                    strNewFmt(
-                        STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, strZ(manifestData(manifest)->backupLabel))));
-
-            // Add encryption filter if required
-            cipherBlockFilterGroupAdd(ioWriteFilterGroup(write), cipherModeEncrypt, cipherSpecManifest);
-
-            // Save file
-            manifestSave(manifest, write);
-        }
-        MEM_CONTEXT_TEMP_END();
-    }
+    if (final ? cipherSpecType(cipherSpecManifest) != cipherTypeAes256Gcm : cfgOptionBool(cfgOptResume))
+        backupManifestSaveFile(manifest, cipherSpecManifest, BACKUP_MANIFEST_FILE INFO_COPY_EXT);
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -101,8 +121,9 @@ backupArchiveCheckCopy(const BackupData *const backupData, Manifest *const manif
                         IoFilterGroup *const filterGroup = ioReadFilterGroup(storageReadIo(read));
 
                         // Decrypt with archive key if encrypted
-                        cipherBlockFilterGroupAdd(
-                            filterGroup, cipherModeDecrypt, infoArchiveCipherSpec(backupData->archiveInfo));
+                        cipherFormatFilterGroupAdd(
+                            filterGroup, cipherModeDecrypt, infoArchiveCipherSpec(backupData->archiveInfo),
+                            archiveCipherIdentity(strNewFmt("%s/%s", strZ(backupData->archiveId), strZ(archiveFile))));
 
                         // Compress/decompress if archive and backup do not have the same compression settings
                         if (archiveCompressType != backupCompressType)
@@ -117,17 +138,18 @@ backupArchiveCheckCopy(const BackupData *const backupData, Manifest *const manif
                             }
                         }
 
-                        // Encrypt with backup key if encrypted
-                        cipherBlockFilterGroupAdd(
-                            filterGroup, cipherModeEncrypt, manifestCipherSpec(manifest));
+                        // Encrypt with backup key if encrypted, as a file of the backup
+                        const String *const manifestName = strNewFmt(
+                            MANIFEST_TARGET_PGDATA "/%s/%s", strZ(pgWalPath(manifestData(manifest)->pgVersion)), strZ(walSegment));
+
+                        cipherFormatFilterGroupAdd(
+                            filterGroup, cipherModeEncrypt, manifestCipherSpec(manifest),
+                            backupFileCipherIdentity(manifestData(manifest)->backupLabel, manifestName));
 
                         // Add size filter last to calculate repo size
                         ioFilterGroupAdd(filterGroup, ioSizeNew());
 
                         // Copy the file
-                        const String *const manifestName = strNewFmt(
-                            MANIFEST_TARGET_PGDATA "/%s/%s", strZ(pgWalPath(manifestData(manifest)->pgVersion)), strZ(walSegment));
-
                         storageCopyP(
                             read,
                             storageNewWriteP(
@@ -188,21 +210,28 @@ backupComplete(InfoBackup *const infoBackup, Manifest *const manifest)
 
         backupManifestSaveCopy(manifest, infoBackupCipherSpec(infoBackup), true);
 
-        storageCopy(
-            storageNewReadP(
-                storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, strZ(backupLabel))),
-            storageNewWriteP(
-                storageRepoWrite(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel))));
+        // An aes-256-gcm manifest is bound to its name, so the final manifest is saved rather than copied from the in-progress one
+        if (cipherSpecType(infoBackupCipherSpec(infoBackup)) == cipherTypeAes256Gcm)
+            backupManifestSaveFile(manifest, infoBackupCipherSpec(infoBackup), BACKUP_MANIFEST_FILE);
+        else
+        {
+            storageCopy(
+                storageNewReadP(
+                    storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE INFO_COPY_EXT, strZ(backupLabel))),
+                storageNewWriteP(
+                    storageRepoWrite(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel))));
+        }
 
         // Copy a compressed version of the manifest to history. If the repo is encrypted then the passphrase to open the manifest
         // is required. We can't just do a straight copy since the destination needs to be compressed and that must happen before
         // encryption in order to be efficient. Compression will always be gz for compatibility and since it is always available.
         // -------------------------------------------------------------------------------------------------------------------------
-        StorageRead *const manifestRead = storageNewReadP(
-            storageRepo(), strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel)));
+        const String *const manifestFileName = strNewFmt(STORAGE_REPO_BACKUP "/%s/" BACKUP_MANIFEST_FILE, strZ(backupLabel));
+        StorageRead *const manifestRead = storageNewReadP(storageRepo(), manifestFileName);
 
-        cipherBlockFilterGroupAdd(
-            ioReadFilterGroup(storageReadIo(manifestRead)), cipherModeDecrypt, infoBackupCipherSpec(infoBackup));
+        cipherFormatFilterGroupAdd(
+            ioReadFilterGroup(storageReadIo(manifestRead)), cipherModeDecrypt, infoBackupCipherSpec(infoBackup),
+            manifestCipherIdentity(manifestFileName));
 
         StorageWrite *const manifestWrite = storageNewWriteP(
             storageRepoWrite(),
@@ -212,8 +241,9 @@ backupComplete(InfoBackup *const infoBackup, Manifest *const manifest)
 
         ioFilterGroupAdd(ioWriteFilterGroup(storageWriteIo(manifestWrite)), compressFilterP(compressTypeGz, 9));
 
-        cipherBlockFilterGroupAdd(
-            ioWriteFilterGroup(storageWriteIo(manifestWrite)), cipherModeEncrypt, infoBackupCipherSpec(infoBackup));
+        cipherFormatFilterGroupAdd(
+            ioWriteFilterGroup(storageWriteIo(manifestWrite)), cipherModeEncrypt, infoBackupCipherSpec(infoBackup),
+            backupManifestHistoryCipherIdentity(backupLabel));
 
         storageCopyP(manifestRead, manifestWrite);
 

@@ -1424,6 +1424,8 @@
             <admonition type="note">Encryption settings are placed in the <id>[global]</id> section, above, so the <cmd>info</cmd> command can read all stanzas. Without the <br-option>stanza</br-option> option the <cmd>info</cmd> command reads encryption settings only from the <id>[global]</id> section, so encryption settings configured per stanza require the <br-option>stanza</br-option> option to read an encrypted stanza.</admonition>
 
             <p>Once the repository has been configured and the stanza created and checked, the repository encryption settings cannot be changed.</p>
+
+            <p>The <id>aes-256-gcm</id> cipher type also authenticates each file of the repository, so a file that has been modified, truncated, or copied to another name, backup, or stanza is refused rather than used. To create a stanza with it, set <br-option>repo1-cipher-type=aes-256-gcm</br-option> and set <br-option>repo1-cipher-pass</br-option> to a key, the base64 of 32 random bytes, e.g. generated with <code>openssl rand -base64 32</code>, before running <cmd>stanza-create</cmd>. The stanza is created at repository format 7, which requires <proper>OpenSSL</proper> 3.0.8 or later and cannot be read by earlier versions of <backrest/>. A repository encrypted with <id>aes-256-cbc</id> cannot be converted to <id>aes-256-gcm</id>, so a new repository is required.</p>
         </section>
 
         <!-- =================================================================================================================== -->

@@ -8,6 +8,7 @@ Archive Common
 
 #include "command/archive/common.h"
 #include "common/debug.h"
+#include "common/format/cipherFormat.h"
 #include "common/log.h"
 #include "common/memContext.h"
 #include "common/regExp.h"
@@ -421,4 +422,38 @@ walSegmentRange(const String *const walSegmentBegin, const size_t walSegmentSize
     MEM_CONTEXT_TEMP_END();
 
     FUNCTION_LOG_RETURN(STRING_LIST, result);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN StringList *
+archiveCipherIdentity(const String *const archiveFile)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, archiveFile);
+    FUNCTION_TEST_END();
+
+    ASSERT(archiveFile != NULL);
+
+    StringList *const result = strLstNew();
+
+    strLstAddZ(result, CIPHER_IDENTITY_ARCHIVE);
+
+    // The name as stored, which includes the WAL directory of a file that begins with a segment name. A caller may give the name
+    // with or without it, so it is added here the same way the storage path of the file adds it (storage/helper.c).
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        const StringList *const pathSplit = strLstNewSplitZ(archiveFile, "/");
+
+        if (strLstSize(pathSplit) == 2 && regExpMatchOne(STRDEF(WAL_SEGMENT_PREFIX_REGEXP), strLstGet(pathSplit, 1)))
+        {
+            const String *const file = strLstGet(pathSplit, 1);
+
+            strLstAddFmt(result, "%s/%.16s/%s", strZ(strLstGet(pathSplit, 0)), strZ(file), strZ(file));
+        }
+        else
+            strLstAdd(result, archiveFile);
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    FUNCTION_TEST_RETURN(STRING_LIST, result);
 }
